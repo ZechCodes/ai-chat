@@ -28,7 +28,13 @@ from claude_agent_sdk import (
 )
 
 from aichat_api import AiChatAPI
-from aichat_hooks import make_pre_tool_hook, make_post_tool_hook, make_stop_hook
+from aichat_hooks import (
+    make_interaction_hook,
+    make_pre_tool_hook,
+    make_post_tool_hook,
+    make_stop_hook,
+)
+from aichat_interactions import InteractionManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -48,7 +54,10 @@ def make_aichat_tools(api: AiChatAPI):
     return [aichat_send]
 
 
-def build_agent_options(api: AiChatAPI) -> ClaudeAgentOptions:
+def build_agent_options(
+    api: AiChatAPI,
+    interactions: InteractionManager,
+) -> ClaudeAgentOptions:
     """Build ClaudeAgentOptions with AI.CHAT hooks and tools."""
     tools = make_aichat_tools(api)
     mcp_server = create_sdk_mcp_server("aichat", tools=tools)
@@ -58,7 +67,12 @@ def build_agent_options(api: AiChatAPI) -> ClaudeAgentOptions:
         permission_mode="bypassPermissions",
         mcp_servers={"aichat": mcp_server},
         hooks={
-            "PreToolUse": [HookMatcher(hooks=[make_pre_tool_hook(api)])],
+            "PreToolUse": [
+                # Interaction hook first — intercepts AskUserQuestion/EnterPlanMode
+                HookMatcher(hooks=[make_interaction_hook(api, interactions)]),
+                # Regular tool status reporting
+                HookMatcher(hooks=[make_pre_tool_hook(api)]),
+            ],
             "PostToolUse": [HookMatcher(hooks=[make_post_tool_hook(api)])],
             "Stop": [HookMatcher(hooks=[make_stop_hook(api)])],
         },
@@ -86,28 +100,51 @@ async def handle_response_message(message, api: AiChatAPI) -> None:
 
 
 def _parse_sse_event(line: str, channel_id: str | None) -> dict | None:
-    """Parse an SSE line, returning message data if it's a user message for our channel."""
+    """Parse an SSE line, returning event data if relevant to our channel."""
     if not line.startswith("data:"):
         return None
     try:
         event = json.loads(line[5:].strip())
     except (json.JSONDecodeError, ValueError):
         return None
+
+    # Check channel match
+    if channel_id and event.get("channel_id") and event.get("channel_id") != channel_id:
+        return None
+
+    event_type = event.get("type")
+
+    # User messages → message queue
     if (
-        event.get("type") == "aichat:message"
+        event_type == "aichat:message"
         and event.get("sender") == "user"
-        and event.get("channel_id") == channel_id
     ):
         return {
+            "_event_type": "message",
             "message_id": event.get("message_id"),
             "content": event.get("content", ""),
             "attachments": event.get("attachments", []),
         }
+
+    # Interaction responses → interaction manager
+    if event_type == "aichat:interaction-response":
+        return {
+            "_event_type": "interaction-response",
+            "interaction_id": event.get("interaction_id"),
+            "action": event.get("action"),
+            "answer": event.get("answer", ""),
+            "reason": event.get("reason", ""),
+        }
+
     return None
 
 
-async def listen_sse(message_queue: asyncio.Queue, api: AiChatAPI) -> None:
-    """Listen to Skrift SSE stream for real-time incoming messages."""
+async def listen_sse(
+    message_queue: asyncio.Queue,
+    interactions: InteractionManager,
+    api: AiChatAPI,
+) -> None:
+    """Listen to Skrift SSE stream for real-time incoming messages and interaction responses."""
     while True:
         try:
             cookies = await api.get_session()
@@ -115,10 +152,22 @@ async def listen_sse(message_queue: asyncio.Queue, api: AiChatAPI) -> None:
             async with httpx.AsyncClient(cookies=cookies, timeout=httpx.Timeout(None, connect=10)) as http:
                 async with http.stream("GET", f"{api.base_url}/notifications/stream") as response:
                     async for line in response.aiter_lines():
-                        msg_data = _parse_sse_event(line, api.channel_id)
-                        if msg_data is not None:
+                        event_data = _parse_sse_event(line, api.channel_id)
+                        if event_data is None:
+                            continue
+
+                        event_type = event_data.pop("_event_type")
+
+                        if event_type == "message":
                             log.info("SSE: received message from Zech")
-                            await message_queue.put(msg_data)
+                            await message_queue.put(event_data)
+
+                        elif event_type == "interaction-response":
+                            interaction_id = event_data.get("interaction_id")
+                            if interaction_id:
+                                log.info("SSE: received interaction response %s", interaction_id)
+                                interactions.deliver_response(interaction_id, event_data)
+
         except httpx.HTTPError as e:
             log.warning("SSE connection error: %s, reconnecting in 5s", e)
             await asyncio.sleep(5)
@@ -143,14 +192,15 @@ async def run_agent(
         channel_id=channel_id,
         base_url=base_url,
     )
-    options = build_agent_options(api)
+    interactions = InteractionManager()
+    options = build_agent_options(api, interactions)
     message_queue: asyncio.Queue[dict] = asyncio.Queue()
 
     await api.send_message("Agent online.")
     log.info("Agent started, channel=%s", api.channel_id)
 
     # Start SSE listener
-    sse_task = asyncio.create_task(listen_sse(message_queue, api))
+    sse_task = asyncio.create_task(listen_sse(message_queue, interactions, api))
 
     try:
         async with ClaudeSDKClient(options=options) as client:
