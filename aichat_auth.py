@@ -49,9 +49,9 @@ def _lookup_token_for_cwd() -> str | None:
 
 def _get_token() -> str | None:
     """Resolve the compound token from env var or tokens.json."""
-    val = os.environ.get("AICHAT_PRIVATE_KEY", "")
-    if val:
-        return val
+    env_token = os.environ.get("AICHAT_PRIVATE_KEY")
+    if env_token:
+        return env_token
     return _lookup_token_for_cwd()
 
 
