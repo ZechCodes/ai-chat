@@ -9,7 +9,7 @@ import pytest
 import respx
 
 from aichat_api import AiChatAPI
-from aichat_agent import build_agent_options, format_unread, handle_response_message
+from aichat_agent import build_agent_options, handle_response_message
 
 
 @pytest.fixture
@@ -33,26 +33,6 @@ class TestBuildAgentOptions:
         options = build_agent_options(api)
         assert options.setting_sources is not None
         assert "project" in options.setting_sources
-
-
-class TestFormatUnread:
-    def test_formats_single_message(self):
-        msgs = [{"content": "Fix the bug", "created_at": "2026-03-09T00:00:00Z"}]
-        result = format_unread(msgs)
-        assert "Fix the bug" in result
-
-    def test_formats_multiple_messages(self):
-        msgs = [
-            {"content": "First msg", "created_at": "2026-03-09T00:00:00Z"},
-            {"content": "Second msg", "created_at": "2026-03-09T00:01:00Z"},
-        ]
-        result = format_unread(msgs)
-        assert "First msg" in result
-        assert "Second msg" in result
-
-    def test_empty_list_returns_none(self):
-        result = format_unread([])
-        assert result is None
 
 
 class TestHandleResponseMessage:

@@ -13,10 +13,11 @@ class TestParseSSEEvent:
             "sender": "user",
             "channel_id": "ch-1",
             "content": "Hello agent",
+            "message_id": "msg-abc",
         })
         line = f"data: {data}"
         result = _parse_sse_event(line, "ch-1")
-        assert result == {"content": "Hello agent", "attachments": []}
+        assert result == {"message_id": "msg-abc", "content": "Hello agent", "attachments": []}
 
     def test_ignores_claude_messages(self):
         data = json.dumps({

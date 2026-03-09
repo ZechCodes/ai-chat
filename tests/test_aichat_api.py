@@ -93,55 +93,34 @@ class TestSendMessage:
         assert "x-channel" in headers
 
 
-class TestGetUnread:
+class TestMarkRead:
     @respx.mock
     @pytest.mark.asyncio
-    async def test_returns_messages(self, api):
-        msgs = [{"content": "hey", "created_at": "2026-03-09T00:00:00Z"}]
-        respx.get("https://test.example.com/api/messages/unread").mock(
-            return_value=httpx.Response(200, json=msgs)
+    async def test_marks_messages_read(self, api):
+        route = respx.post("https://test.example.com/api/messages/read").mock(
+            return_value=httpx.Response(200, json={"marked": ["msg-1", "msg-2"]})
         )
-        result = await api.get_unread()
-        assert result == msgs
+        result = await api.mark_read(["msg-1", "msg-2"])
+        assert result == {"marked": ["msg-1", "msg-2"]}
+        body = json.loads(route.calls[0].request.content)
+        assert body["message_ids"] == ["msg-1", "msg-2"]
+
+    @pytest.mark.asyncio
+    async def test_skips_empty_list(self, api):
+        result = await api.mark_read([])
+        assert result == {"marked": []}
 
     @respx.mock
     @pytest.mark.asyncio
-    async def test_returns_empty_list(self, api):
-        respx.get("https://test.example.com/api/messages/unread").mock(
-            return_value=httpx.Response(200, json=[])
+    async def test_includes_auth_headers(self, api):
+        route = respx.post("https://test.example.com/api/messages/read").mock(
+            return_value=httpx.Response(200, json={"marked": ["msg-1"]})
         )
-        result = await api.get_unread()
-        assert result == []
-
-
-class TestGetMessages:
-    @respx.mock
-    @pytest.mark.asyncio
-    async def test_returns_messages_with_default_limit(self, api):
-        msgs = [{"content": "msg1"}, {"content": "msg2"}]
-        route = respx.get("https://test.example.com/api/messages").mock(
-            return_value=httpx.Response(200, json=msgs)
-        )
-        result = await api.get_messages()
-        assert result == msgs
-
-    @respx.mock
-    @pytest.mark.asyncio
-    async def test_passes_limit_param(self, api):
-        route = respx.get("https://test.example.com/api/messages").mock(
-            return_value=httpx.Response(200, json=[])
-        )
-        await api.get_messages(limit=5)
-        assert "limit=5" in str(route.calls[0].request.url)
-
-    @respx.mock
-    @pytest.mark.asyncio
-    async def test_passes_before_param(self, api):
-        route = respx.get("https://test.example.com/api/messages").mock(
-            return_value=httpx.Response(200, json=[])
-        )
-        await api.get_messages(before="msg-abc")
-        assert "before=msg-abc" in str(route.calls[0].request.url)
+        await api.mark_read(["msg-1"])
+        headers = route.calls[0].request.headers
+        assert "x-timestamp" in headers
+        assert "x-signature" in headers
+        assert "x-channel" in headers
 
 
 class TestSendToolStatus:

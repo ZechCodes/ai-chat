@@ -51,25 +51,20 @@ class AiChatAPI:
             resp.raise_for_status()
             return resp.json()
 
-    async def get_unread(self) -> list[dict]:
-        """GET /api/messages/unread"""
-        path = "/api/messages/unread"
-        headers = self._sign_request("GET", path)
+    async def mark_read(self, message_ids: list[str]) -> dict:
+        """POST /api/messages/read"""
+        if not message_ids:
+            return {"marked": []}
+        path = "/api/messages/read"
+        headers = self._sign_request("POST", path)
+        headers["Content-Type"] = "application/json"
         async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{self.base_url}{path}", headers=headers)
-            resp.raise_for_status()
-            return resp.json()
-
-    async def get_messages(self, limit: int = 10, before: str | None = None) -> list[dict]:
-        """GET /api/messages"""
-        params = {"limit": str(limit)}
-        if before:
-            params["before"] = before
-        query = "&".join(f"{k}={v}" for k, v in params.items())
-        path = f"/api/messages?{query}"
-        headers = self._sign_request("GET", path)
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{self.base_url}{path}", headers=headers)
+            resp = await client.post(
+                f"{self.base_url}{path}",
+                json={"message_ids": message_ids},
+                headers=headers,
+                timeout=5,
+            )
             resp.raise_for_status()
             return resp.json()
 

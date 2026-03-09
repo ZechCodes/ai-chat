@@ -45,23 +45,7 @@ def make_aichat_tools(api: AiChatAPI):
         except Exception as e:
             return {"content": [{"type": "text", "text": f"Failed to send: {e}"}], "is_error": True}
 
-    @tool("aichat_read", "Read recent message history from AI.CHAT", {"limit": int})
-    async def aichat_read(args):
-        try:
-            messages = await api.get_messages(limit=args.get("limit", 10))
-            if not messages:
-                return {"content": [{"type": "text", "text": "No messages."}]}
-            parts = []
-            for msg in messages:
-                sender = msg.get("sender", "unknown")
-                content = msg.get("content", "")
-                ts = msg.get("created_at", "")
-                parts.append(f"[{ts}] {sender}: {content}")
-            return {"content": [{"type": "text", "text": "\n".join(parts)}]}
-        except Exception as e:
-            return {"content": [{"type": "text", "text": f"Failed to read: {e}"}], "is_error": True}
-
-    return [aichat_send, aichat_read]
+    return [aichat_send]
 
 
 def build_agent_options(api: AiChatAPI) -> ClaudeAgentOptions:
@@ -79,16 +63,6 @@ def build_agent_options(api: AiChatAPI) -> ClaudeAgentOptions:
             "Stop": [HookMatcher(hooks=[make_stop_hook(api)])],
         },
     )
-
-
-def format_unread(messages: list[dict]) -> str | None:
-    """Format unread messages into a prompt for the agent."""
-    if not messages:
-        return None
-    parts = []
-    for msg in messages:
-        parts.append(f"[{msg['created_at']}] {msg['content']}")
-    return "Unread messages from Zech:\n" + "\n".join(parts)
 
 
 async def handle_response_message(message, api: AiChatAPI) -> None:
@@ -125,6 +99,7 @@ def _parse_sse_event(line: str, channel_id: str | None) -> dict | None:
         and event.get("channel_id") == channel_id
     ):
         return {
+            "message_id": event.get("message_id"),
             "content": event.get("content", ""),
             "attachments": event.get("attachments", []),
         }
@@ -185,14 +160,12 @@ async def run_agent(
                 "Messages from Zech are delivered to you automatically via SSE — "
                 "do NOT set up cron jobs, /loop, or polling for messages. "
                 "Do NOT run aichat-unread or aichat-read CLI commands. "
-                "Use the aichat_send tool to send messages to Zech. "
-                "Use the aichat_read tool to read message history.\n\n"
+                "Use the aichat_send tool to send messages to Zech.\n\n"
             )
             if initial_prompt:
                 prompt = sse_context + initial_prompt
             else:
-                unread = await api.get_unread()
-                prompt = sse_context + (format_unread(unread) or "Check in with Zech.")
+                prompt = sse_context + "Check in with Zech."
 
             # Initial query
             log.info("Sending initial prompt to agent")
@@ -205,7 +178,15 @@ async def run_agent(
                 msg_data = await message_queue.get()
                 log.info("Processing incoming message")
                 content = msg_data.get("content", "")
+                message_id = msg_data.get("message_id")
                 attachments = msg_data.get("attachments", [])
+
+                # Mark as read now that we're delivering it to Claude
+                if message_id:
+                    try:
+                        await api.mark_read([message_id])
+                    except Exception as e:
+                        log.warning("Failed to mark message read: %s", e)
 
                 # Download image attachments to temp files for Claude to view
                 attachment_notes = []
