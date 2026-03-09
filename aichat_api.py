@@ -111,6 +111,21 @@ class AiChatAPI:
             resp.raise_for_status()
             return resp.json()
 
+    async def send_event(self, event_type: str) -> dict:
+        """POST /api/event — fire-and-forget channel event."""
+        path = "/api/event"
+        headers = self._sign_request("POST", path)
+        headers["Content-Type"] = "application/json"
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{self.base_url}{path}",
+                json={"event_type": event_type},
+                headers=headers,
+                timeout=5,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
     async def download_attachment(self, url: str) -> str:
         """Download an attachment to a temp file, return the file path."""
         full_url = url if url.startswith("http") else f"{self.base_url}{url}"

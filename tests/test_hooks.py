@@ -22,7 +22,7 @@ class TestPreToolHook:
         route = respx.post("https://test.example.com/api/tool-status").mock(
             return_value=httpx.Response(200, json={"ok": True})
         )
-        hook = make_pre_tool_hook(api)
+        hook = make_pre_tool_hook(api, {})
         input_data = {
             "hook_event_name": "PreToolUse",
             "tool_name": "Read",
@@ -34,7 +34,7 @@ class TestPreToolHook:
             "permission_mode": None,
         }
         result = await hook(input_data, "tu-1", None)
-        assert result == {}
+        assert result == {"continue_": True}
         assert route.called
         body = json.loads(route.calls[0].request.content)
         assert body["status"] == "active"
@@ -47,7 +47,7 @@ class TestPreToolHook:
         route = respx.post("https://test.example.com/api/tool-status").mock(
             return_value=httpx.Response(200, json={"ok": True})
         )
-        hook = make_pre_tool_hook(api)
+        hook = make_pre_tool_hook(api, {})
         input_data = {
             "hook_event_name": "PreToolUse",
             "tool_name": "Bash",
@@ -59,7 +59,7 @@ class TestPreToolHook:
             "permission_mode": None,
         }
         result = await hook(input_data, "tu-2", None)
-        assert result == {}
+        assert result == {"continue_": True}
         assert not route.called
 
     @respx.mock
@@ -68,7 +68,7 @@ class TestPreToolHook:
         route = respx.post("https://test.example.com/api/tool-status").mock(
             return_value=httpx.Response(200, json={"ok": True})
         )
-        hook = make_pre_tool_hook(api)
+        hook = make_pre_tool_hook(api, {})
         input_data = {
             "hook_event_name": "PreToolUse",
             "tool_name": "Bash",

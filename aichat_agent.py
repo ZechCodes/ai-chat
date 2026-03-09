@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import sys
 
 import httpx
 
@@ -29,6 +28,7 @@ from claude_agent_sdk import (
 
 from aichat_api import AiChatAPI
 from aichat_hooks import (
+    make_can_use_tool,
     make_interaction_hook,
     make_pre_tool_hook,
     make_post_tool_hook,
@@ -38,6 +38,27 @@ from aichat_interactions import InteractionManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SDK monkey-patch: prevent premature stdin closure (SDK bug in 0.1.48)
+#
+# The SDK closes stdin after the first assistant message arrives, but hooks
+# need the control stream open for the entire query duration. Without this
+# patch, ALL hook callbacks fail with "Stream closed" errors because the CLI
+# can't send control_requests back to the Python process.
+# ---------------------------------------------------------------------------
+from claude_agent_sdk._internal import query as _sdk_query  # noqa: E402
+
+
+async def _patched_wait_for_result_and_end_input(self) -> None:
+    """No-op replacement — keep stdin open for hooks throughout the query."""
+    if self.sdk_mcp_servers or self.hooks:
+        log.debug("Keeping stdin open for hook callbacks (patched)")
+    else:
+        await self.transport.end_input()
+
+
+_sdk_query.Query.wait_for_result_and_end_input = _patched_wait_for_result_and_end_input
 
 
 def make_aichat_tools(api: AiChatAPI):
@@ -62,16 +83,20 @@ def build_agent_options(
     tools = make_aichat_tools(api)
     mcp_server = create_sdk_mcp_server("aichat", tools=tools)
 
+    # Shared state between hooks and can_use_tool for tracking Write calls
+    hook_state: dict = {}
+
     return ClaudeAgentOptions(
         setting_sources=["project"],
-        permission_mode="bypassPermissions",
+        permission_mode="plan",
+        can_use_tool=make_can_use_tool(api, interactions, hook_state),
         mcp_servers={"aichat": mcp_server},
         hooks={
             "PreToolUse": [
-                # Interaction hook first — intercepts AskUserQuestion/EnterPlanMode
+                # Interaction hook — intercepts AskUserQuestion
                 HookMatcher(hooks=[make_interaction_hook(api, interactions)]),
-                # Regular tool status reporting
-                HookMatcher(hooks=[make_pre_tool_hook(api)]),
+                # Regular tool status reporting + Write tracking
+                HookMatcher(hooks=[make_pre_tool_hook(api, hook_state)]),
             ],
             "PostToolUse": [HookMatcher(hooks=[make_post_tool_hook(api)])],
             "Stop": [HookMatcher(hooks=[make_stop_hook(api)])],

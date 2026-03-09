@@ -10,6 +10,7 @@ import respx
 
 from aichat_api import AiChatAPI
 from aichat_agent import build_agent_options, handle_response_message
+from aichat_interactions import InteractionManager
 
 
 @pytest.fixture
@@ -17,20 +18,29 @@ def api(env_with_token):
     return AiChatAPI()
 
 
+@pytest.fixture
+def interactions():
+    return InteractionManager()
+
+
 class TestBuildAgentOptions:
-    def test_returns_options_with_hooks(self, api):
-        options = build_agent_options(api)
+    def test_returns_options_with_hooks(self, api, interactions):
+        options = build_agent_options(api, interactions)
         assert options.hooks is not None
         assert "PreToolUse" in options.hooks
         assert "PostToolUse" in options.hooks
         assert "Stop" in options.hooks
 
-    def test_sets_permission_mode(self, api):
-        options = build_agent_options(api)
-        assert options.permission_mode == "bypassPermissions"
+    def test_sets_permission_mode(self, api, interactions):
+        options = build_agent_options(api, interactions)
+        assert options.permission_mode == "plan"
 
-    def test_loads_project_settings(self, api):
-        options = build_agent_options(api)
+    def test_sets_can_use_tool(self, api, interactions):
+        options = build_agent_options(api, interactions)
+        assert options.can_use_tool is not None
+
+    def test_loads_project_settings(self, api, interactions):
+        options = build_agent_options(api, interactions)
         assert options.setting_sources is not None
         assert "project" in options.setting_sources
 

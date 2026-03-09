@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -14,7 +15,8 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # Tools that trigger the interaction overlay instead of normal execution
-INTERACTION_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
+# AskUserQuestion is intercepted in PreToolUse; ExitPlanMode in can_use_tool
+INTERACTION_TOOLS = {"AskUserQuestion", "EnterPlanMode", "ExitPlanMode"}
 
 
 def _describe_tool(tool_name: str, tool_input: dict) -> str:
@@ -59,53 +61,60 @@ def _is_own_api_call(tool_name: str, tool_input: dict) -> bool:
     return False
 
 
-def _read_plan_from_transcript(transcript_path: str) -> str:
-    """Read the plan content by finding the plan file from the transcript.
+def _read_plan_file(tool_input: dict, last_written_file: str | None) -> str:
+    """Read the plan content for ExitPlanMode approval.
 
-    Scans the transcript JSONL for Write tool uses to find the plan file,
-    then reads its content. Falls back to a generic message.
+    Plan files are written to ~/.claude/plans/ during plan mode. We find them by:
+    1. Checking tool_input for a file path
+    2. Using the last file written by the Write tool (tracked by hooks)
+    3. Finding the most recently modified file in ~/.claude/plans/
     """
-    plan_file_path = None
-    try:
-        with open(transcript_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+    # 1. Check tool_input for a path reference
+    for key in ("plan_file", "file_path", "path"):
+        path = tool_input.get(key)
+        if path and os.path.isfile(path):
+            return _read_file_content(path)
 
-                # Look for assistant messages with Write tool_use blocks
-                if entry.get("type") != "assistant":
-                    continue
-                message = entry.get("message", {})
-                for block in message.get("content", []):
-                    if (
-                        block.get("type") == "tool_use"
-                        and block.get("name") == "Write"
-                    ):
-                        path = block.get("input", {}).get("file_path", "")
-                        if path:
-                            plan_file_path = path
-    except (OSError, KeyError):
-        log.warning("Failed to parse transcript at %s", transcript_path)
+    # 2. Use last written file if tracked
+    if last_written_file and os.path.isfile(last_written_file):
+        return _read_file_content(last_written_file)
 
-    if plan_file_path:
-        try:
-            with open(plan_file_path) as f:
-                content = f.read().strip()
-            if content:
-                return content
-        except OSError:
-            log.warning("Failed to read plan file at %s", plan_file_path)
+    # 3. Find most recent plan file in ~/.claude/plans/
+    plans_dir = Path.home() / ".claude" / "plans"
+    if plans_dir.is_dir():
+        plan_files = sorted(plans_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if plan_files:
+            return _read_file_content(str(plan_files[0]))
 
+    log.warning("Could not find plan file; tool_input=%s", json.dumps(tool_input, default=str)[:300])
     return "Claude has finished designing an implementation plan and is requesting approval."
 
 
+def _read_file_content(path: str) -> str:
+    """Read a file's content, returning a fallback on error."""
+    try:
+        content = Path(path).read_text().strip()
+        if content:
+            log.info("Read plan from %s (%d chars)", path, len(content))
+            return content
+    except OSError as e:
+        log.warning("Failed to read plan file %s: %s", path, e)
+    return "Claude has finished designing an implementation plan and is requesting approval."
+
+
+def _deny(input_data, reason: str):
+    """Return a properly formatted deny decision for PreToolUse hooks."""
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": input_data.get("hook_event_name", "PreToolUse"),
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
 def make_interaction_hook(api: AiChatAPI, interactions: InteractionManager):
-    """Create a PreToolUse hook that intercepts AskUserQuestion and ExitPlanMode.
+    """Create a PreToolUse hook that intercepts AskUserQuestion.
 
     Sends the interaction to the web UI via the server and blocks until
     the user responds (approve/deny/answer).
@@ -134,61 +143,103 @@ def make_interaction_hook(api: AiChatAPI, interactions: InteractionManager):
             interaction_id = result.get("interaction_id")
 
             if not interaction_id:
-                return {"decision": "block", "reason": "Failed to create interaction"}
+                return _deny(input_data, "Failed to create interaction")
 
             response = await interactions.wait_for_response(interaction_id)
             await api.send_tool_status("done", tool="AskUserQuestion")
 
             answer = response.get("answer", "")
             if response.get("action") == "deny":
-                return {"decision": "block", "reason": "User declined to answer the question."}
+                return _deny(input_data, "User declined to answer the question.")
 
-            return {"decision": "block", "reason": f"User answered: {answer}"}
+            return _deny(input_data, f"User answered: {answer}")
 
-        if tool_name == "ExitPlanMode":
-            log.info("Intercepted ExitPlanMode")
-
-            # Read the plan content from the transcript's last Write target
-            transcript_path = input_data.get("transcript_path", "")
-            plan_content = _read_plan_from_transcript(transcript_path)
-
-            await api.send_tool_status("active", tool="ExitPlanMode", description="Awaiting plan approval...")
-            result = await api.create_interaction("plan", plan_content)
-            interaction_id = result.get("interaction_id")
-
-            if not interaction_id:
-                return {"decision": "block", "reason": "Failed to create interaction"}
-
-            response = await interactions.wait_for_response(interaction_id)
-            await api.send_tool_status("done", tool="ExitPlanMode")
-
-            if response.get("action") == "accept":
-                return {}  # Allow — proceed with implementation
-
-            reason = response.get("reason", "User rejected the plan.")
-            return {"decision": "block", "reason": reason}
-
-        return {}  # Not an interaction tool, pass through
+        return {"continue_": True}  # Not an interaction tool, pass through
 
     return hook
 
 
-def make_pre_tool_hook(api: AiChatAPI):
-    """Create a PreToolUse hook that reports active status."""
+def make_can_use_tool(api: AiChatAPI, interactions: InteractionManager, hook_state: dict):
+    """Create a can_use_tool callback for ClaudeAgentOptions.
+
+    The CLI dispatches ExitPlanMode (and other permission-gated tools) through
+    the can_use_tool control request — NOT through PermissionRequest hooks.
+    This callback handles ExitPlanMode approval via the interaction system and
+    auto-allows everything else.
+
+    hook_state is shared with PreToolUse/PostToolUse hooks to track the last
+    file written (used to find the plan file).
+    """
+    from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny, ToolPermissionContext
+
+    async def callback(
+        tool_name: str,
+        tool_input: dict,
+        context: ToolPermissionContext,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        if tool_name == "EnterPlanMode":
+            try:
+                await api.send_event("plan:enter")
+            except Exception:
+                log.warning("Failed to send plan:enter event")
+            return PermissionResultAllow()
+
+        if tool_name != "ExitPlanMode":
+            return PermissionResultAllow()
+
+        log.info("Intercepted ExitPlanMode (can_use_tool), input keys=%s", list(tool_input.keys()))
+
+        plan_content = _read_plan_file(tool_input, hook_state.get("last_written_file"))
+
+        await api.send_tool_status("active", tool="ExitPlanMode", description="Awaiting plan approval...")
+        result = await api.create_interaction("plan", plan_content)
+        interaction_id = result.get("interaction_id")
+
+        if not interaction_id:
+            return PermissionResultDeny(message="Failed to create interaction")
+
+        response = await interactions.wait_for_response(interaction_id)
+        await api.send_tool_status("done", tool="ExitPlanMode")
+
+        if response.get("action") == "accept":
+            try:
+                await api.send_event("plan:exit")
+            except Exception:
+                log.warning("Failed to send plan:exit event")
+            return PermissionResultAllow()
+
+        reason = response.get("reason", "User rejected the plan.")
+        try:
+            await api.send_event("plan:exit")
+        except Exception:
+            log.warning("Failed to send plan:exit event")
+        return PermissionResultDeny(message=reason)
+
+    return callback
+
+
+def make_pre_tool_hook(api: AiChatAPI, hook_state: dict):
+    """Create a PreToolUse hook that reports active status and tracks writes."""
 
     async def hook(input_data, tool_use_id, context):
         tool_name = input_data.get("tool_name", "")
         tool_input = input_data.get("tool_input", {})
 
+        # Track Write calls so can_use_tool can find the plan file
+        if tool_name == "Write":
+            path = tool_input.get("file_path", "")
+            if path:
+                hook_state["last_written_file"] = path
+
         # Skip interaction tools (handled by interaction hook) and own API calls
         if tool_name in INTERACTION_TOOLS:
-            return {}
+            return {"continue_": True}
         if _is_own_api_call(tool_name, tool_input):
-            return {}
+            return {"continue_": True}
 
         description = _describe_tool(tool_name, tool_input)
         await api.send_tool_status("active", tool=tool_name, description=description)
-        return {}
+        return {"continue_": True}
 
     return hook
 
