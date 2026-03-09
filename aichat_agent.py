@@ -43,7 +43,7 @@ log = logging.getLogger(__name__)
 def make_aichat_tools(api: AiChatAPI):
     """Create SDK MCP tools for AI.CHAT messaging."""
 
-    @tool("aichat_send", "Send a message to Zech via AI.CHAT", {"message": str})
+    @tool("send", "Send a message to the user via AI.CHAT", {"message": str})
     async def aichat_send(args):
         try:
             result = await api.send_message(args["message"])
@@ -206,11 +206,15 @@ async def run_agent(
         async with ClaudeSDKClient(options=options) as client:
             # Determine initial prompt
             sse_context = (
-                "IMPORTANT: You are running inside the Agent SDK wrapper. "
-                "Messages from Zech are delivered to you automatically via SSE — "
-                "do NOT set up cron jobs, /loop, or polling for messages. "
-                "Do NOT run aichat-unread or aichat-read CLI commands. "
-                "Use the aichat_send tool to send messages to Zech.\n\n"
+                "IMPORTANT: You are communicating with the user through a chat interface.\n"
+                "- Messages from the user are delivered to you automatically — "
+                "do NOT set up cron jobs, /loop, or polling for messages.\n"
+                "- Do NOT run aichat-unread or aichat-read CLI commands.\n"
+                "- The user CANNOT see your text responses. The ONLY way to communicate "
+                "with the user is by calling the mcp__aichat__send tool. "
+                "Every time you want to tell the user something, you MUST call "
+                "mcp__aichat__send. Never just write a text response "
+                "and assume the user will see it.\n\n"
             )
             if initial_prompt:
                 prompt = sse_context + initial_prompt
