@@ -11,14 +11,35 @@ from aichat_auth import get_channel_id, get_private_key, sign_request
 class AiChatAPI:
     """Async client for AI.CHAT API endpoints."""
 
-    def __init__(self, base_url: str | None = None, token: str | None = None):
+    def __init__(
+        self,
+        base_url: str | None = None,
+        token: str | None = None,
+        device_key: str | None = None,
+        device_id: str | None = None,
+        channel_id: str | None = None,
+    ):
         self.base_url = (base_url or os.environ.get("AICHAT_URL", "https://aichat.zech.sh")).rstrip("/")
-        self._private_key = get_private_key(token=token)
-        self.channel_id = get_channel_id(token=token)
+        self.device_id = device_id
+
+        if device_key:
+            # Device key auth: use device's key with channel_id
+            import base64 as _b64
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            key_bytes = _b64.b64decode(device_key)
+            self._private_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
+            self.channel_id = channel_id
+        else:
+            # Legacy: compound token or tokens.json
+            self._private_key = get_private_key(token=token)
+            self.channel_id = channel_id or get_channel_id(token=token)
 
     def _sign_request(self, method: str, path: str) -> dict[str, str]:
         """Sign a request and return auth headers."""
-        return sign_request(method, path, private_key=self._private_key, channel_id=self.channel_id)
+        headers = sign_request(method, path, private_key=self._private_key, channel_id=self.channel_id)
+        if self.device_id:
+            headers["X-Device-Id"] = self.device_id
+        return headers
 
     async def send_message(self, content: str) -> dict:
         """POST /api/messages"""

@@ -68,8 +68,13 @@ class DeviceManager:
         self.workers: dict[str, WorkerProcess] = {}
         self.last_event_ts: str | None = None
 
-    async def start_worker(self, channel_id: str, channel_token: str) -> None:
-        """Launch a worker subprocess for the given channel."""
+    async def start_worker(self, channel_id: str, channel_token: str = "") -> None:
+        """Launch a worker subprocess for the given channel.
+
+        Workers authenticate with the device's private key + channel_id.
+        The channel_token parameter is kept for backward compat with SSE commands
+        but is no longer used for auth.
+        """
         # Stop existing worker for this channel if any
         if channel_id in self.workers:
             await self.stop_worker(channel_id)
@@ -79,7 +84,11 @@ class DeviceManager:
         env.pop("AICHAT_PRIVATE_KEY", None)  # Don't leak parent env
 
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, "aichat_agent.py", "--token", channel_token,
+            sys.executable, "aichat_agent.py",
+            "--device-key", self.private_key_b64,
+            "--device-id", self.device_id,
+            "--channel-id", channel_id,
+            "--base-url", self.base_url,
             env=env,
             cwd=os.path.dirname(os.path.abspath(__file__)),
         )
@@ -169,6 +178,39 @@ class DeviceManager:
             "device_id": self.device_id,
             "workers": workers,
         }
+
+    async def sync_channels(self) -> None:
+        """Query server for assigned channels and reconcile with running workers.
+
+        Starts workers for channels that should be running but aren't,
+        and stops workers for channels no longer assigned to this device.
+        """
+        try:
+            headers = self._sign_request("GET", "/api/device/channels")
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{self.base_url}/api/device/channels",
+                    headers=headers,
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as e:
+            log.warning("Failed to fetch device channels: %s", e)
+            return
+
+        server_channel_ids = {ch["id"] for ch in data.get("channels", [])}
+        local_channel_ids = set(self.workers.keys())
+
+        # Stop workers for channels no longer assigned
+        for channel_id in local_channel_ids - server_channel_ids:
+            log.info("Channel %s removed from device, stopping worker", channel_id)
+            await self.stop_worker(channel_id)
+
+        # Start workers for channels missing locally
+        for channel_id in server_channel_ids - local_channel_ids:
+            log.info("Channel %s assigned to device, starting worker", channel_id)
+            await self.start_worker(channel_id)
 
     async def report_status(self) -> None:
         """Report device status to the server."""
@@ -398,8 +440,9 @@ async def run_manager() -> None:
         base_url=config.base_url,
     )
 
-    # Report online
+    # Report online and sync channels
     await manager.report_status()
+    await manager.sync_channels()
 
     try:
         # Run SSE listener and worker monitor concurrently

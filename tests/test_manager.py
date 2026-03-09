@@ -249,6 +249,36 @@ class TestDeviceManager:
             })
             mock_rotate.assert_called_once()
 
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_sync_channels_starts_missing(self, manager):
+        respx.get("https://aichat.zech.sh/api/device/channels").mock(
+            return_value=httpx.Response(200, json={"channels": [
+                {"id": "ch-1", "name": "Task 1"},
+                {"id": "ch-2", "name": "Task 2"},
+            ]})
+        )
+        new_proc = AsyncMock()
+        new_proc.returncode = None
+        with patch("aichat_manager.asyncio.create_subprocess_exec", return_value=new_proc):
+            await manager.sync_channels()
+        assert "ch-1" in manager.workers
+        assert "ch-2" in manager.workers
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_sync_channels_stops_removed(self, manager):
+        proc = AsyncMock()
+        proc.wait = AsyncMock()
+        manager.workers["ch-old"] = WorkerProcess(proc=proc, channel_id="ch-old", channel_token="")
+
+        respx.get("https://aichat.zech.sh/api/device/channels").mock(
+            return_value=httpx.Response(200, json={"channels": []})
+        )
+        await manager.sync_channels()
+        assert "ch-old" not in manager.workers
+        proc.terminate.assert_called_once()
+
     @pytest.mark.asyncio
     async def test_monitor_detects_crashed_worker(self, manager):
         crashed_proc = AsyncMock()

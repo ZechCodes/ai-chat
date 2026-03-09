@@ -116,9 +116,22 @@ async def listen_sse(message_queue: asyncio.Queue, api: AiChatAPI) -> None:
             await asyncio.sleep(10)
 
 
-async def run_agent(initial_prompt: str | None = None, token: str | None = None) -> None:
+async def run_agent(
+    initial_prompt: str | None = None,
+    token: str | None = None,
+    device_key: str | None = None,
+    device_id: str | None = None,
+    channel_id: str | None = None,
+    base_url: str | None = None,
+) -> None:
     """Main agent loop."""
-    api = AiChatAPI(token=token)
+    api = AiChatAPI(
+        token=token,
+        device_key=device_key,
+        device_id=device_id,
+        channel_id=channel_id,
+        base_url=base_url,
+    )
     options = build_agent_options(api)
     message_queue: asyncio.Queue[dict] = asyncio.Queue()
 
@@ -202,11 +215,22 @@ def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(description="AI.CHAT Agent SDK wrapper")
     parser.add_argument("prompt", nargs="*", help="Initial prompt")
-    parser.add_argument("--token", help="Compound auth token (passed by manager)")
+    parser.add_argument("--token", help="Compound auth token (legacy)")
+    parser.add_argument("--device-key", help="Device private key (b64)")
+    parser.add_argument("--device-id", help="Device ID")
+    parser.add_argument("--channel-id", help="Channel ID")
+    parser.add_argument("--base-url", help="API base URL")
     args = parser.parse_args()
 
     initial_prompt = " ".join(args.prompt) if args.prompt else None
-    asyncio.run(run_agent(initial_prompt, token=args.token))
+    asyncio.run(run_agent(
+        initial_prompt,
+        token=args.token,
+        device_key=args.device_key,
+        device_id=args.device_id,
+        channel_id=args.channel_id,
+        base_url=args.base_url,
+    ))
 
 
 if __name__ == "__main__":
