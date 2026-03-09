@@ -206,51 +206,6 @@ class TestDeviceManager:
 
     @respx.mock
     @pytest.mark.asyncio
-    async def test_rotate_key(self, manager):
-        route = respx.post("https://aichat.zech.sh/api/device/rotate-key").mock(
-            return_value=httpx.Response(200, json={"ok": True})
-        )
-        old_key = manager.private_key_b64
-
-        with patch("aichat_manager.load_device_config", return_value=None):
-            await manager.rotate_key()
-
-        assert route.called
-        assert manager.private_key_b64 != old_key
-
-    @respx.mock
-    @pytest.mark.asyncio
-    async def test_rotate_key_saves_config(self, manager):
-        respx.post("https://aichat.zech.sh/api/device/rotate-key").mock(
-            return_value=httpx.Response(200, json={"ok": True})
-        )
-        mock_config = MagicMock()
-        with patch("aichat_device_auth.load_device_config", return_value=mock_config) as _, \
-             patch("aichat_device_auth.save_device_config") as mock_save:
-            await manager.rotate_key()
-            mock_save.assert_called_once_with(mock_config)
-
-    @respx.mock
-    @pytest.mark.asyncio
-    async def test_rotate_key_failure_keeps_old_key(self, manager):
-        respx.post("https://aichat.zech.sh/api/device/rotate-key").mock(
-            return_value=httpx.Response(500)
-        )
-        old_key = manager.private_key_b64
-        await manager.rotate_key()
-        assert manager.private_key_b64 == old_key
-
-    @pytest.mark.asyncio
-    async def test_handle_command_rotate_key(self, manager):
-        with patch.object(manager, "rotate_key", new_callable=AsyncMock) as mock_rotate:
-            await manager.handle_command({
-                "command": "device:rotate-key",
-                "payload": {},
-            })
-            mock_rotate.assert_called_once()
-
-    @respx.mock
-    @pytest.mark.asyncio
     async def test_sync_channels_starts_missing(self, manager):
         respx.get("https://aichat.zech.sh/api/device/channels").mock(
             return_value=httpx.Response(200, json={"channels": [

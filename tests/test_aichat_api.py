@@ -27,11 +27,28 @@ class TestAiChatAPIInit:
 
     def test_raises_without_token(self, monkeypatch, tmp_path):
         monkeypatch.delenv("AICHAT_PRIVATE_KEY", raising=False)
+        monkeypatch.delenv("AICHAT_DEVICE_KEY", raising=False)
+        monkeypatch.delenv("AICHAT_DEVICE_ID", raising=False)
+        monkeypatch.delenv("AICHAT_CHANNEL_ID", raising=False)
         # Point tokens.json lookup to a nonexistent path
         import aichat_auth
         monkeypatch.setattr(aichat_auth, "TOKENS_PATH", tmp_path / "nonexistent.json")
         with pytest.raises(SystemExit):
             AiChatAPI()
+
+    def test_device_key_auth(self, ed25519_keypair, monkeypatch, tmp_path):
+        import aichat_auth
+        monkeypatch.setattr(aichat_auth, "TOKENS_PATH", tmp_path / "nonexistent.json")
+        api = AiChatAPI(
+            device_key=ed25519_keypair["private_b64"],
+            device_id="dev-test",
+            channel_id="ch-test",
+        )
+        assert api.channel_id == "ch-test"
+        assert api.device_id == "dev-test"
+        headers = api._sign_request("GET", "/api/messages")
+        assert headers["X-Device-Id"] == "dev-test"
+        assert headers["X-Channel"] == "ch-test"
 
 
 class TestSignRequest:

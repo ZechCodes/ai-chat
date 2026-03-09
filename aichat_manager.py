@@ -68,6 +68,30 @@ class DeviceManager:
         self.workers: dict[str, WorkerProcess] = {}
         self.last_event_ts: str | None = None
 
+    def _save_worker_pids(self) -> None:
+        """Persist current worker PIDs to device config."""
+        try:
+            config = load_device_config()
+            if not config:
+                return
+            config.workers = {
+                cid: {"pid": w.proc.pid, "started_at": w.started_at}
+                for cid, w in self.workers.items()
+                if w.proc.pid is not None and isinstance(w.proc.pid, int)
+            }
+            save_device_config(config)
+        except Exception as e:
+            log.warning("Failed to save worker PIDs: %s", e)
+
+    def _kill_stale_pid(self, channel_id: str, pid: int) -> None:
+        """Kill a stale worker process from a previous run."""
+        try:
+            os.kill(pid, 0)  # Check if alive
+            log.info("Killing stale worker for channel %s (pid=%s)", channel_id, pid)
+            os.kill(pid, 15)  # SIGTERM
+        except OSError:
+            pass  # Already dead
+
     async def start_worker(self, channel_id: str, channel_token: str = "") -> None:
         """Launch a worker subprocess for the given channel.
 
@@ -83,6 +107,11 @@ class DeviceManager:
         env.pop("CLAUDECODE", None)  # Prevent nested Claude Code detection
         env.pop("AICHAT_PRIVATE_KEY", None)  # Don't leak parent env
 
+        # Set device auth env vars so CLI tools (aichat-send etc) route correctly
+        env["AICHAT_DEVICE_KEY"] = self.private_key_b64
+        env["AICHAT_DEVICE_ID"] = self.device_id
+        env["AICHAT_CHANNEL_ID"] = channel_id
+
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "aichat_agent.py",
             "--device-key", self.private_key_b64,
@@ -96,6 +125,7 @@ class DeviceManager:
             proc=proc, channel_id=channel_id, channel_token=channel_token
         )
         log.info("Started worker for channel %s (pid=%s)", channel_id, proc.pid)
+        self._save_worker_pids()
 
     async def stop_worker(self, channel_id: str) -> None:
         """Gracefully stop a worker."""
@@ -110,6 +140,7 @@ class DeviceManager:
             log.warning("Worker %s did not exit in time, killing", channel_id)
             worker.proc.kill()
             await worker.proc.wait()
+        self._save_worker_pids()
 
     async def handle_command(self, cmd: dict) -> None:
         """Handle a parsed device command."""
@@ -128,9 +159,6 @@ class DeviceManager:
         elif command == "device:ping":
             log.info("Ping received, reporting status")
             await self.report_status()
-        elif command == "device:rotate-key":
-            log.info("Key rotation requested")
-            await self.rotate_key()
         elif command == "device:update":
             log.info("Device update: %s", payload)
         else:
@@ -182,8 +210,12 @@ class DeviceManager:
     async def sync_channels(self) -> None:
         """Query server for assigned channels and reconcile with running workers.
 
-        Starts workers for channels that should be running but aren't,
-        and stops workers for channels no longer assigned to this device.
+        On startup this also cleans up stale worker processes from a previous
+        manager run by reading saved PIDs from device config. The flow:
+        1. Fetch assigned channels from server
+        2. Kill stale PIDs for channels no longer assigned
+        3. Stop live workers for channels no longer assigned
+        4. Start workers for channels not yet running
         """
         try:
             headers = self._sign_request("GET", "/api/device/channels")
@@ -202,13 +234,33 @@ class DeviceManager:
         server_channel_ids = {ch["id"] for ch in data.get("channels", [])}
         local_channel_ids = set(self.workers.keys())
 
-        # Stop workers for channels no longer assigned
+        # Check for stale PIDs from a previous run
+        config = load_device_config()
+        saved_pids = config.workers if config else {}
+
+        # Kill stale PIDs for channels no longer assigned
+        for channel_id, info in saved_pids.items():
+            if channel_id not in server_channel_ids:
+                pid = info.get("pid")
+                if pid:
+                    self._kill_stale_pid(channel_id, pid)
+
+        # Stop live workers for channels no longer assigned
         for channel_id in local_channel_ids - server_channel_ids:
             log.info("Channel %s removed from device, stopping worker", channel_id)
             await self.stop_worker(channel_id)
 
-        # Start workers for channels missing locally
+        # Start workers for channels not yet running (unless stale PID is still alive)
         for channel_id in server_channel_ids - local_channel_ids:
+            if channel_id in saved_pids:
+                pid = saved_pids[channel_id].get("pid")
+                if pid:
+                    try:
+                        os.kill(pid, 0)  # Check if alive
+                        log.info("Channel %s has live worker from previous run (pid=%s), keeping it", channel_id, pid)
+                        continue
+                    except OSError:
+                        pass  # Dead, start a new one
             log.info("Channel %s assigned to device, starting worker", channel_id)
             await self.start_worker(channel_id)
 
@@ -227,49 +279,6 @@ class DeviceManager:
                 )
         except Exception as e:
             log.warning("Failed to report status: %s", e)
-
-    async def rotate_key(self) -> None:
-        """Generate a new keypair and register it with the server.
-
-        Signs the rotation request with the current key, sends the new public key,
-        then updates local config and in-memory key.
-        """
-        import base64 as _b64
-
-        from aichat_device_auth import load_device_config, save_device_config
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-        new_key = Ed25519PrivateKey.generate()
-        new_private_b64 = _b64.b64encode(new_key.private_bytes_raw()).decode()
-        new_public_b64 = _b64.b64encode(
-            new_key.public_key().public_bytes_raw()
-        ).decode()
-
-        try:
-            headers = self._sign_request("POST", "/api/device/rotate-key")
-            headers["Content-Type"] = "application/json"
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{self.base_url}/api/device/rotate-key",
-                    json={"public_key": new_public_b64},
-                    headers=headers,
-                    timeout=10,
-                )
-                resp.raise_for_status()
-
-            # Update in-memory key
-            self.private_key_b64 = new_private_b64
-
-            # Update saved config
-            config = load_device_config()
-            if config:
-                config.private_key_b64 = new_private_b64
-                config.public_key_b64 = new_public_b64
-                save_device_config(config)
-
-            log.info("Device key rotated successfully")
-        except Exception as e:
-            log.error("Key rotation failed: %s", e)
 
     def _sign_request(self, method: str, path: str) -> dict[str, str]:
         """Sign a request with device Ed25519 key."""
@@ -431,8 +440,16 @@ async def run_manager() -> None:
 
     log.info("Device: %s (%s)", config.device_name, config.device_id)
 
-    # Get session cookie for SSE
-    cookies = await get_session_for_device(config)
+    # Get session cookie for SSE, re-register on 401
+    try:
+        cookies = await get_session_for_device(config)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            log.warning("Device auth failed (401), re-registering...")
+            config = await device_auth_flow(base_url)
+            cookies = await get_session_for_device(config)
+        else:
+            raise
 
     manager = DeviceManager(
         device_id=config.device_id,
@@ -440,7 +457,7 @@ async def run_manager() -> None:
         base_url=config.base_url,
     )
 
-    # Report online and sync channels
+    # Report online and sync channels (also cleans up stale workers)
     await manager.report_status()
     await manager.sync_channels()
 

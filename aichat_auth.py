@@ -1,8 +1,9 @@
 """Shared Ed25519 request signing for aichat API clients.
 
 Token resolution order:
-1. AICHAT_PRIVATE_KEY env var (compound token)
-2. ~/.config/aichat/tokens.json keyed by working directory
+1. Device auth env vars (AICHAT_DEVICE_KEY + AICHAT_DEVICE_ID + AICHAT_CHANNEL_ID)
+2. Direct token parameter
+3. ~/.config/aichat/tokens.json keyed by working directory
 """
 
 import base64
@@ -47,16 +48,27 @@ def _lookup_token_for_cwd() -> str | None:
         return None
 
 
+def _has_device_env() -> bool:
+    """Check if device auth env vars are set."""
+    return bool(os.environ.get("AICHAT_DEVICE_KEY") and os.environ.get("AICHAT_CHANNEL_ID"))
+
+
 def _get_token() -> str | None:
     """Resolve the compound token from tokens.json."""
     return _lookup_token_for_cwd()
 
 
 def get_private_key(token: str | None = None) -> Ed25519PrivateKey:
-    """Load the Ed25519 private key from token."""
+    """Load the Ed25519 private key from token or device env vars."""
+    # Device auth env vars take priority
+    device_key = os.environ.get("AICHAT_DEVICE_KEY")
+    if device_key:
+        key_bytes = base64.b64decode(device_key)
+        return Ed25519PrivateKey.from_private_bytes(key_bytes)
+
     token = token or _get_token()
     if not token:
-        raise SystemExit("Error: No aichat token found (set AICHAT_PRIVATE_KEY or register with aichat-register)")
+        raise SystemExit("Error: No aichat token found (set AICHAT_DEVICE_KEY or register with aichat-register)")
 
     parsed = _parse_compound_token(token)
     if not parsed:
@@ -68,7 +80,12 @@ def get_private_key(token: str | None = None) -> Ed25519PrivateKey:
 
 
 def get_channel_id(token: str | None = None) -> str | None:
-    """Extract channel_id from the compound token."""
+    """Extract channel_id from the compound token or device env vars."""
+    # Device auth env vars take priority
+    channel_id = os.environ.get("AICHAT_CHANNEL_ID")
+    if channel_id:
+        return channel_id
+
     token = token or _get_token()
     if not token:
         return None
@@ -78,9 +95,14 @@ def get_channel_id(token: str | None = None) -> str | None:
     return None
 
 
+def get_device_id() -> str | None:
+    """Get device ID from env var."""
+    return os.environ.get("AICHAT_DEVICE_ID")
+
+
 def has_token() -> bool:
-    """Check if a token is available (for hooks to decide whether to no-op)."""
-    return _get_token() is not None
+    """Check if auth credentials are available (for hooks to decide whether to no-op)."""
+    return _has_device_env() or _get_token() is not None
 
 
 def sign_request(
@@ -102,4 +124,7 @@ def sign_request(
         channel_id = get_channel_id()
     if channel_id:
         headers["X-Channel"] = channel_id
+    device_id = get_device_id()
+    if device_id:
+        headers["X-Device-Id"] = device_id
     return headers

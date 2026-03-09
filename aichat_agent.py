@@ -23,6 +23,8 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     HookMatcher,
     TextBlock,
+    create_sdk_mcp_server,
+    tool,
 )
 
 from aichat_api import AiChatAPI
@@ -32,11 +34,45 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 
+def make_aichat_tools(api: AiChatAPI):
+    """Create SDK MCP tools for AI.CHAT messaging."""
+
+    @tool("aichat_send", "Send a message to Zech via AI.CHAT", {"message": str})
+    async def aichat_send(args):
+        try:
+            result = await api.send_message(args["message"])
+            return {"content": [{"type": "text", "text": f"Message sent: {result.get('id', 'ok')}"}]}
+        except Exception as e:
+            return {"content": [{"type": "text", "text": f"Failed to send: {e}"}], "is_error": True}
+
+    @tool("aichat_read", "Read recent message history from AI.CHAT", {"limit": int})
+    async def aichat_read(args):
+        try:
+            messages = await api.get_messages(limit=args.get("limit", 10))
+            if not messages:
+                return {"content": [{"type": "text", "text": "No messages."}]}
+            parts = []
+            for msg in messages:
+                sender = msg.get("sender", "unknown")
+                content = msg.get("content", "")
+                ts = msg.get("created_at", "")
+                parts.append(f"[{ts}] {sender}: {content}")
+            return {"content": [{"type": "text", "text": "\n".join(parts)}]}
+        except Exception as e:
+            return {"content": [{"type": "text", "text": f"Failed to read: {e}"}], "is_error": True}
+
+    return [aichat_send, aichat_read]
+
+
 def build_agent_options(api: AiChatAPI) -> ClaudeAgentOptions:
-    """Build ClaudeAgentOptions with AI.CHAT hooks."""
+    """Build ClaudeAgentOptions with AI.CHAT hooks and tools."""
+    tools = make_aichat_tools(api)
+    mcp_server = create_sdk_mcp_server("aichat", tools=tools)
+
     return ClaudeAgentOptions(
         setting_sources=["project"],
         permission_mode="bypassPermissions",
+        mcp_servers={"aichat": mcp_server},
         hooks={
             "PreToolUse": [HookMatcher(hooks=[make_pre_tool_hook(api)])],
             "PostToolUse": [HookMatcher(hooks=[make_post_tool_hook(api)])],
@@ -148,8 +184,9 @@ async def run_agent(
                 "IMPORTANT: You are running inside the Agent SDK wrapper. "
                 "Messages from Zech are delivered to you automatically via SSE — "
                 "do NOT set up cron jobs, /loop, or polling for messages. "
-                "Do NOT run aichat-unread or aichat-read to check for messages. "
-                "Use aichat-send to send messages to Zech.\n\n"
+                "Do NOT run aichat-unread or aichat-read CLI commands. "
+                "Use the aichat_send tool to send messages to Zech. "
+                "Use the aichat_read tool to read message history.\n\n"
             )
             if initial_prompt:
                 prompt = sse_context + initial_prompt

@@ -10,7 +10,7 @@ import base64
 import json
 import os
 import stat
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import httpx
@@ -28,6 +28,7 @@ class DeviceConfig:
     private_key_b64: str
     public_key_b64: str
     base_url: str
+    workers: dict[str, dict] = field(default_factory=dict)
 
 
 def generate_device_keypair() -> dict:
@@ -58,6 +59,7 @@ def load_device_config(path: Path = DEFAULT_CONFIG_PATH) -> DeviceConfig | None:
         return None
     try:
         data = json.loads(path.read_text())
+        data.setdefault("workers", {})
         return DeviceConfig(**data)
     except Exception:
         return None
