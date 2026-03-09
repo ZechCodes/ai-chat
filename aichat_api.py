@@ -90,12 +90,22 @@ class AiChatAPI:
             resp.raise_for_status()
             return resp.cookies
 
-    async def create_interaction(self, interaction_type: str, content: str) -> dict:
+    async def create_interaction(
+        self,
+        interaction_type: str,
+        content: str,
+        *,
+        options: list[dict] | None = None,
+        multi_select: bool = False,
+    ) -> dict:
         """POST /api/interaction — create a pending interaction (question or plan)."""
         path = "/api/interaction"
         headers = self._sign_request("POST", path)
         headers["Content-Type"] = "application/json"
-        body = {"type": interaction_type, "content": content}
+        body: dict = {"type": interaction_type, "content": content}
+        if options:
+            body["options"] = options
+            body["multi_select"] = multi_select
         async with httpx.AsyncClient() as client:
             resp = await client.post(f"{self.base_url}{path}", json=body, headers=headers)
             resp.raise_for_status()

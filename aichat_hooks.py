@@ -70,11 +70,21 @@ def make_interaction_hook(api: AiChatAPI, interactions: InteractionManager):
         tool_input = input_data.get("tool_input", {})
 
         if tool_name == "AskUserQuestion":
-            question = tool_input.get("question", "")
+            # Extract question text and options from the questions array
+            questions = tool_input.get("questions", [])
+            if questions:
+                q = questions[0]
+                question = q.get("question", "")
+                options = q.get("options", [])
+                multi_select = q.get("multiSelect", False)
+            else:
+                question = tool_input.get("question", "")
+                options = []
+                multi_select = False
             log.info("Intercepted AskUserQuestion: %s", question[:100])
 
             await api.send_tool_status("active", tool="AskUserQuestion", description="Asking question...")
-            result = await api.create_interaction("question", question)
+            result = await api.create_interaction("question", question, options=options, multi_select=multi_select)
             interaction_id = result.get("interaction_id")
 
             if not interaction_id:
