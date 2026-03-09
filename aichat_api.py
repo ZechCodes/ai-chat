@@ -13,12 +13,12 @@ class AiChatAPI:
 
     def __init__(self, base_url: str | None = None, token: str | None = None):
         self.base_url = (base_url or os.environ.get("AICHAT_URL", "https://aichat.zech.sh")).rstrip("/")
-        self._private_key = get_private_key()
-        self.channel_id = get_channel_id()
+        self._private_key = get_private_key(token=token)
+        self.channel_id = get_channel_id(token=token)
 
     def _sign_request(self, method: str, path: str) -> dict[str, str]:
         """Sign a request and return auth headers."""
-        return sign_request(method, path, private_key=self._private_key)
+        return sign_request(method, path, private_key=self._private_key, channel_id=self.channel_id)
 
     async def send_message(self, content: str) -> dict:
         """POST /api/messages"""

@@ -74,11 +74,12 @@ class DeviceManager:
         if channel_id in self.workers:
             await self.stop_worker(channel_id)
 
-        env = {**os.environ, "AICHAT_PRIVATE_KEY": channel_token}
+        env = {**os.environ}
         env.pop("CLAUDECODE", None)  # Prevent nested Claude Code detection
+        env.pop("AICHAT_PRIVATE_KEY", None)  # Don't leak parent env
 
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, "aichat_agent.py",
+            sys.executable, "aichat_agent.py", "--token", channel_token,
             env=env,
             cwd=os.path.dirname(os.path.abspath(__file__)),
         )

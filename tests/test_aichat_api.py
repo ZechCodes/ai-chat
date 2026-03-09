@@ -12,7 +12,7 @@ from aichat_api import AiChatAPI
 @pytest.fixture
 def api(env_with_token):
     """Create an AiChatAPI instance with test token."""
-    return AiChatAPI()
+    return AiChatAPI(token=env_with_token)
 
 
 class TestAiChatAPIInit:

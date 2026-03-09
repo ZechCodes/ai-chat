@@ -48,16 +48,13 @@ def _lookup_token_for_cwd() -> str | None:
 
 
 def _get_token() -> str | None:
-    """Resolve the compound token from env var or tokens.json."""
-    env_token = os.environ.get("AICHAT_PRIVATE_KEY")
-    if env_token and _parse_compound_token(env_token) is not None:
-        return env_token
+    """Resolve the compound token from tokens.json."""
     return _lookup_token_for_cwd()
 
 
-def get_private_key() -> Ed25519PrivateKey:
+def get_private_key(token: str | None = None) -> Ed25519PrivateKey:
     """Load the Ed25519 private key from token."""
-    token = _get_token()
+    token = token or _get_token()
     if not token:
         raise SystemExit("Error: No aichat token found (set AICHAT_PRIVATE_KEY or register with aichat-register)")
 
@@ -70,9 +67,9 @@ def get_private_key() -> Ed25519PrivateKey:
     return Ed25519PrivateKey.from_private_bytes(key_bytes)
 
 
-def get_channel_id() -> str | None:
+def get_channel_id(token: str | None = None) -> str | None:
     """Extract channel_id from the compound token."""
-    token = _get_token()
+    token = token or _get_token()
     if not token:
         return None
     parsed = _parse_compound_token(token)
@@ -87,7 +84,7 @@ def has_token() -> bool:
 
 
 def sign_request(
-    method: str, path: str, *, private_key: Ed25519PrivateKey
+    method: str, path: str, *, private_key: Ed25519PrivateKey, channel_id: str | None = None
 ) -> dict[str, str]:
     """Sign a request and return headers to include.
 
@@ -101,7 +98,8 @@ def sign_request(
         "X-Timestamp": timestamp,
         "X-Signature": base64.b64encode(signature).decode(),
     }
-    channel_id = get_channel_id()
+    if channel_id is None:
+        channel_id = get_channel_id()
     if channel_id:
         headers["X-Channel"] = channel_id
     return headers
