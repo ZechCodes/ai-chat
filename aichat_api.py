@@ -1,0 +1,101 @@
+"""Unified async client for AI.CHAT API endpoints."""
+
+import os
+import tempfile
+
+import httpx
+
+from aichat_auth import get_channel_id, get_private_key, sign_request
+
+
+class AiChatAPI:
+    """Async client for AI.CHAT API endpoints."""
+
+    def __init__(self, base_url: str | None = None, token: str | None = None):
+        self.base_url = (base_url or os.environ.get("AICHAT_URL", "https://aichat.zech.sh")).rstrip("/")
+        self._private_key = get_private_key()
+        self.channel_id = get_channel_id()
+
+    def _sign_request(self, method: str, path: str) -> dict[str, str]:
+        """Sign a request and return auth headers."""
+        return sign_request(method, path, private_key=self._private_key)
+
+    async def send_message(self, content: str) -> dict:
+        """POST /api/messages"""
+        path = "/api/messages"
+        headers = self._sign_request("POST", path)
+        headers["Content-Type"] = "application/json"
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(f"{self.base_url}{path}", json={"content": content}, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def get_unread(self) -> list[dict]:
+        """GET /api/messages/unread"""
+        path = "/api/messages/unread"
+        headers = self._sign_request("GET", path)
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{self.base_url}{path}", headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def get_messages(self, limit: int = 10, before: str | None = None) -> list[dict]:
+        """GET /api/messages"""
+        params = {"limit": str(limit)}
+        if before:
+            params["before"] = before
+        query = "&".join(f"{k}={v}" for k, v in params.items())
+        path = f"/api/messages?{query}"
+        headers = self._sign_request("GET", path)
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{self.base_url}{path}", headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def send_tool_status(self, status: str, tool: str = "", description: str = "") -> None:
+        """POST /api/tool-status"""
+        path = "/api/tool-status"
+        headers = self._sign_request("POST", path)
+        headers["Content-Type"] = "application/json"
+        body: dict = {"status": status}
+        if tool:
+            body["tool"] = tool
+        if description:
+            body["description"] = description
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(f"{self.base_url}{path}", json=body, headers=headers, timeout=5)
+
+    async def get_session(self) -> httpx.Cookies:
+        """POST /api/session — exchange Ed25519 auth for a session cookie."""
+        path = "/api/session"
+        headers = self._sign_request("POST", path)
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(f"{self.base_url}{path}", headers=headers)
+            resp.raise_for_status()
+            return resp.cookies
+
+    async def download_attachment(self, url: str) -> str:
+        """Download an attachment to a temp file, return the file path."""
+        full_url = url if url.startswith("http") else f"{self.base_url}{url}"
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            resp = await client.get(full_url, timeout=30)
+            resp.raise_for_status()
+
+        # Determine extension from content-type
+        ct = resp.headers.get("content-type", "")
+        ext = ".png"
+        if "jpeg" in ct or "jpg" in ct:
+            ext = ".jpg"
+        elif "gif" in ct:
+            ext = ".gif"
+        elif "webp" in ct:
+            ext = ".webp"
+        elif "svg" in ct:
+            ext = ".svg"
+
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=ext, prefix="aichat_img_", delete=False
+        )
+        tmp.write(resp.content)
+        tmp.close()
+        return tmp.name
