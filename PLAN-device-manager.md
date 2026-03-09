@@ -258,11 +258,11 @@ Each device section shows:
 - Edit device (rename/delete)
 - Worker status per channel
 
-### Phase 5: Polish
-- Device auth CLI UX (auto-open browser, QR code option)
-- Graceful shutdown (manager sends offline status)
-- Worker health reporting (memory, uptime)
-- Device token rotation
+### Phase 5: Polish ✓
+- Device auth CLI UX (auto-open browser) ✓
+- Graceful shutdown (manager sends offline status) ✓
+- Worker health reporting (memory RSS + uptime in status) ✓
+- Device key rotation (`device:rotate-key` command + `/api/device/rotate-key` endpoint) ✓
 
 ## Security Considerations
 

@@ -118,21 +118,51 @@ class DeviceManager:
         elif command == "device:ping":
             log.info("Ping received, reporting status")
             await self.report_status()
+        elif command == "device:rotate-key":
+            log.info("Key rotation requested")
+            await self.rotate_key()
         elif command == "device:update":
             log.info("Device update: %s", payload)
         else:
             log.warning("Unknown command: %s", command)
 
+    def _get_worker_memory_mb(self, pid: int) -> float | None:
+        """Get RSS memory usage for a worker process in MB."""
+        try:
+            # /proc/{pid}/statm on Linux, ps on macOS
+            if sys.platform == "darwin":
+                import subprocess
+                result = subprocess.run(
+                    ["ps", "-o", "rss=", "-p", str(pid)],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return int(result.stdout.strip()) / 1024  # KB → MB
+            else:
+                statm = f"/proc/{pid}/statm"
+                with open(statm) as f:
+                    pages = int(f.read().split()[1])  # RSS in pages
+                    import os as _os
+                    return pages * _os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+        except Exception:
+            pass
+        return None
+
     def get_status(self) -> dict:
-        """Get current device status."""
+        """Get current device status with worker health info."""
         workers = []
         for channel_id, worker in self.workers.items():
             status = "running" if worker.proc.returncode is None else "crashed"
-            workers.append({
+            info = {
                 "channel_id": channel_id,
                 "status": status,
                 "uptime": int(time.time() - worker.started_at),
-            })
+            }
+            if status == "running" and worker.proc.pid:
+                mem = self._get_worker_memory_mb(worker.proc.pid)
+                if mem is not None:
+                    info["memory_mb"] = round(mem, 1)
+            workers.append(info)
         return {
             "status": "online",
             "device_id": self.device_id,
@@ -154,6 +184,49 @@ class DeviceManager:
                 )
         except Exception as e:
             log.warning("Failed to report status: %s", e)
+
+    async def rotate_key(self) -> None:
+        """Generate a new keypair and register it with the server.
+
+        Signs the rotation request with the current key, sends the new public key,
+        then updates local config and in-memory key.
+        """
+        import base64 as _b64
+
+        from aichat_device_auth import load_device_config, save_device_config
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        new_key = Ed25519PrivateKey.generate()
+        new_private_b64 = _b64.b64encode(new_key.private_bytes_raw()).decode()
+        new_public_b64 = _b64.b64encode(
+            new_key.public_key().public_bytes_raw()
+        ).decode()
+
+        try:
+            headers = self._sign_request("POST", "/api/device/rotate-key")
+            headers["Content-Type"] = "application/json"
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{self.base_url}/api/device/rotate-key",
+                    json={"public_key": new_public_b64},
+                    headers=headers,
+                    timeout=10,
+                )
+                resp.raise_for_status()
+
+            # Update in-memory key
+            self.private_key_b64 = new_private_b64
+
+            # Update saved config
+            config = load_device_config()
+            if config:
+                config.private_key_b64 = new_private_b64
+                config.public_key_b64 = new_public_b64
+                save_device_config(config)
+
+            log.info("Device key rotated successfully")
+        except Exception as e:
+            log.error("Key rotation failed: %s", e)
 
     def _sign_request(self, method: str, path: str) -> dict[str, str]:
         """Sign a request with device Ed25519 key."""

@@ -29,6 +29,22 @@ aichat-register TOKEN [DIRECTORY]
 ```
 Register a compound token for a working directory. If directory is omitted, uses cwd.
 
+## Agent SDK Wrapper (Optional)
+
+An alternative to the hook + CLI script approach. Runs Claude Code as an SDK-managed agent with real-time SSE message delivery.
+
+```bash
+# Start the SDK agent for the current project
+uv run python3 aichat_agent.py
+
+# With an initial prompt
+uv run python3 aichat_agent.py "Fix the auth bug"
+```
+
+## Device Manager Plan
+
+See [PLAN-device-manager.md](./PLAN-device-manager.md) for the implementation plan for device-level auth with a manager/worker architecture. The manager authenticates devices, receives commands via SSE, and launches/monitors Agent SDK workers per channel.
+
 ## Rules
 
 Never use plan mode. It is imperative that you do not use plan mode. Zech may
