@@ -34,6 +34,7 @@ from aichat_hooks import (
     make_pre_tool_hook,
     make_post_tool_hook,
     make_stop_hook,
+    make_pre_compact_hook,
 )
 from aichat_interactions import InteractionManager
 
@@ -115,6 +116,7 @@ def build_agent_options(
                 HookMatcher(hooks=[make_pre_tool_hook(api, hook_state)]),
             ],
             "PostToolUse": [HookMatcher(hooks=[make_post_tool_hook(api)])],
+            "PreCompact": [HookMatcher(hooks=[make_pre_compact_hook(api)])],
             "Stop": [HookMatcher(hooks=[make_stop_hook(api)])],
         },
     )

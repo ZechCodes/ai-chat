@@ -270,3 +270,16 @@ def make_stop_hook(api: AiChatAPI):
         return {}
 
     return hook
+
+
+def make_pre_compact_hook(api: AiChatAPI):
+    """Create a PreCompact hook that notifies when context compaction starts."""
+
+    async def hook(input_data, tool_use_id, context):
+        trigger = input_data.get("trigger", "auto")
+        await api.send_tool_status(
+            "active", tool="compact", description=f"Compacting context ({trigger})..."
+        )
+        return {}
+
+    return hook
