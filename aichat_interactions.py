@@ -22,16 +22,13 @@ class InteractionManager:
         self._pending: dict[str, asyncio.Event] = {}
         self._responses: dict[str, dict] = {}
 
-    async def wait_for_response(self, interaction_id: str, timeout: float = 600) -> dict:
-        """Block until the SSE listener delivers a response (up to timeout seconds)."""
+    async def wait_for_response(self, interaction_id: str) -> dict:
+        """Block until the SSE listener delivers a response (waits indefinitely)."""
         event = asyncio.Event()
         self._pending[interaction_id] = event
         try:
-            await asyncio.wait_for(event.wait(), timeout=timeout)
+            await event.wait()
             return self._responses.pop(interaction_id, {"action": "deny"})
-        except asyncio.TimeoutError:
-            log.warning("Interaction %s timed out after %.0fs", interaction_id, timeout)
-            return {"action": "deny", "reason": "Timed out waiting for response"}
         finally:
             self._pending.pop(interaction_id, None)
 
