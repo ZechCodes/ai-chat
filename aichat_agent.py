@@ -201,6 +201,7 @@ async def listen_sse(
 
                         if event_type == "message":
                             log.info("SSE: received message from Zech")
+                            interactions.cancel_all()
                             await message_queue.put(event_data)
 
                         elif event_type == "interaction-response":
