@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 
 import httpx
 
@@ -62,7 +63,7 @@ _sdk_query.Query.wait_for_result_and_end_input = _patched_wait_for_result_and_en
 
 
 def make_aichat_tools(api: AiChatAPI):
-    """Create SDK MCP tools for AI.CHAT messaging."""
+    """Create SDK MCP tools for AI.CHAT messaging and directory management."""
 
     @tool("send", "Send a message to the user via AI.CHAT", {"message": str})
     async def aichat_send(args):
@@ -72,7 +73,22 @@ def make_aichat_tools(api: AiChatAPI):
         except Exception as e:
             return {"content": [{"type": "text", "text": f"Failed to send: {e}"}], "is_error": True}
 
-    return [aichat_send]
+    @tool(
+        "set_directories",
+        "Report your working directory and any additional project directories you are accessing. "
+        "Call this when you start working in a new directory or need access to additional project roots.",
+        {"working_directory": str, "additional_directories": list},
+    )
+    async def aichat_set_directories(args):
+        try:
+            working_dir = args.get("working_directory", "")
+            additional = args.get("additional_directories", [])
+            await api.report_directories(working_dir, additional or None)
+            return {"content": [{"type": "text", "text": "Directories updated."}]}
+        except Exception as e:
+            return {"content": [{"type": "text", "text": f"Failed to update directories: {e}"}], "is_error": True}
+
+    return [aichat_send, aichat_set_directories]
 
 
 def build_agent_options(
@@ -221,8 +237,16 @@ async def run_agent(
     options = build_agent_options(api, interactions)
     message_queue: asyncio.Queue[dict] = asyncio.Queue()
 
+    # Report working directory to server
+    cwd = os.getcwd()
+    try:
+        await api.report_directories(cwd)
+        log.info("Reported working directory: %s", cwd)
+    except Exception as e:
+        log.warning("Failed to report working directory: %s", e)
+
     await api.send_message("Agent online.")
-    log.info("Agent started, channel=%s", api.channel_id)
+    log.info("Agent started, channel=%s, cwd=%s", api.channel_id, cwd)
 
     # Start SSE listener
     sse_task = asyncio.create_task(listen_sse(message_queue, interactions, api))
@@ -317,7 +341,13 @@ def main() -> None:
     parser.add_argument("--device-id", help="Device ID")
     parser.add_argument("--channel-id", help="Channel ID")
     parser.add_argument("--base-url", help="API base URL")
+    parser.add_argument("--working-directory", help="Working directory for this agent")
     args = parser.parse_args()
+
+    # Change to working directory if specified
+    if args.working_directory and os.path.isdir(args.working_directory):
+        os.chdir(args.working_directory)
+        log.info("Changed working directory to: %s", args.working_directory)
 
     initial_prompt = " ".join(args.prompt) if args.prompt else None
     asyncio.run(run_agent(

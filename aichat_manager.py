@@ -39,6 +39,7 @@ class WorkerProcess:
     channel_id: str
     channel_token: str
     started_at: float = 0.0
+    working_directory: str = ""
 
     def __post_init__(self):
         if not self.started_at:
@@ -75,7 +76,11 @@ class DeviceManager:
             if not config:
                 return
             config.workers = {
-                cid: {"pid": w.proc.pid, "started_at": w.started_at}
+                cid: {
+                    "pid": w.proc.pid,
+                    "started_at": w.started_at,
+                    "working_directory": w.working_directory,
+                }
                 for cid, w in self.workers.items()
                 if w.proc.pid is not None and isinstance(w.proc.pid, int)
             }
@@ -92,7 +97,9 @@ class DeviceManager:
         except OSError:
             pass  # Already dead
 
-    async def start_worker(self, channel_id: str, channel_token: str = "") -> None:
+    async def start_worker(
+        self, channel_id: str, channel_token: str = "", working_directory: str = ""
+    ) -> None:
         """Launch a worker subprocess for the given channel.
 
         Workers authenticate with the device's private key + channel_id.
@@ -112,19 +119,36 @@ class DeviceManager:
         env["AICHAT_DEVICE_ID"] = self.device_id
         env["AICHAT_CHANNEL_ID"] = channel_id
 
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, "aichat_agent.py",
+        # Use absolute path for agent script since cwd may differ
+        agent_script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "aichat_agent.py"
+        )
+
+        # Determine working directory: use specified dir if valid, else manager dir
+        manager_dir = os.path.dirname(os.path.abspath(__file__))
+        cwd = working_directory if working_directory and os.path.isdir(working_directory) else manager_dir
+
+        cmd = [
+            sys.executable, agent_script,
             "--device-key", self.private_key_b64,
             "--device-id", self.device_id,
             "--channel-id", channel_id,
             "--base-url", self.base_url,
-            env=env,
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-        )
+        ]
+        if working_directory:
+            cmd.extend(["--working-directory", working_directory])
+
+        proc = await asyncio.create_subprocess_exec(*cmd, env=env, cwd=cwd)
         self.workers[channel_id] = WorkerProcess(
-            proc=proc, channel_id=channel_id, channel_token=channel_token
+            proc=proc,
+            channel_id=channel_id,
+            channel_token=channel_token,
+            working_directory=working_directory,
         )
-        log.info("Started worker for channel %s (pid=%s)", channel_id, proc.pid)
+        log.info(
+            "Started worker for channel %s (pid=%s, cwd=%s)",
+            channel_id, proc.pid, cwd,
+        )
         self._save_worker_pids()
 
     async def stop_worker(self, channel_id: str) -> None:
@@ -133,7 +157,11 @@ class DeviceManager:
         if not worker:
             return
         log.info("Stopping worker for channel %s", channel_id)
-        worker.proc.terminate()
+        try:
+            worker.proc.terminate()
+        except ProcessLookupError:
+            self._save_worker_pids()
+            return
         try:
             await asyncio.wait_for(worker.proc.wait(), timeout=10)
         except asyncio.TimeoutError:
@@ -148,14 +176,22 @@ class DeviceManager:
         payload = cmd.get("payload", {})
 
         if command == "worker:start":
-            await self.start_worker(payload["channel_id"], payload["channel_token"])
+            await self.start_worker(
+                payload["channel_id"],
+                payload.get("channel_token", ""),
+                payload.get("working_directory", ""),
+            )
         elif command == "worker:stop":
             await self.stop_worker(payload["channel_id"])
         elif command == "worker:restart":
             channel_id = payload["channel_id"]
             token = self.workers.get(channel_id, None)
             channel_token = token.channel_token if token else payload.get("channel_token", "")
-            await self.start_worker(channel_id, channel_token)
+            working_directory = payload.get("working_directory", "")
+            # Fall back to previously known working directory
+            if not working_directory and token:
+                working_directory = token.working_directory
+            await self.start_worker(channel_id, channel_token, working_directory)
         elif command == "device:ping":
             log.info("Ping received, reporting status")
             await self.report_status()
@@ -231,7 +267,8 @@ class DeviceManager:
             log.warning("Failed to fetch device channels: %s", e)
             return
 
-        server_channel_ids = {ch["id"] for ch in data.get("channels", [])}
+        server_channels = {ch["id"]: ch for ch in data.get("channels", [])}
+        server_channel_ids = set(server_channels.keys())
         local_channel_ids = set(self.workers.keys())
 
         # Check for stale PIDs from a previous run
@@ -261,8 +298,10 @@ class DeviceManager:
                         continue
                     except OSError:
                         pass  # Dead, start a new one
-            log.info("Channel %s assigned to device, starting worker", channel_id)
-            await self.start_worker(channel_id)
+            ch_info = server_channels[channel_id]
+            working_directory = ch_info.get("working_directory", "")
+            log.info("Channel %s assigned to device, starting worker (cwd=%s)", channel_id, working_directory or "<default>")
+            await self.start_worker(channel_id, working_directory=working_directory)
 
     async def report_status(self) -> None:
         """Report device status to the server."""
@@ -303,7 +342,7 @@ class DeviceManager:
         for channel_id, worker in list(self.workers.items()):
             if worker.proc.returncode is not None:
                 log.warning("Worker %s crashed (rc=%s), restarting", channel_id, worker.proc.returncode)
-                await self.start_worker(channel_id, worker.channel_token)
+                await self.start_worker(channel_id, worker.channel_token, worker.working_directory)
 
     async def monitor_workers(self) -> None:
         """Continuously monitor workers for crashes."""

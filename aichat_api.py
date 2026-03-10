@@ -46,7 +46,7 @@ class AiChatAPI:
         path = "/api/messages"
         headers = self._sign_request("POST", path)
         headers["Content-Type"] = "application/json"
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(f"{self.base_url}{path}", json={"content": content}, headers=headers)
             resp.raise_for_status()
             return resp.json()
@@ -58,7 +58,7 @@ class AiChatAPI:
         path = "/api/messages/read"
         headers = self._sign_request("POST", path)
         headers["Content-Type"] = "application/json"
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{self.base_url}{path}",
                 json={"message_ids": message_ids},
@@ -78,14 +78,14 @@ class AiChatAPI:
             body["tool"] = tool
         if description:
             body["description"] = description
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(f"{self.base_url}{path}", json=body, headers=headers, timeout=5)
 
     async def get_session(self) -> httpx.Cookies:
         """POST /api/session — exchange Ed25519 auth for a session cookie."""
         path = "/api/session"
         headers = self._sign_request("POST", path)
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(f"{self.base_url}{path}", headers=headers)
             resp.raise_for_status()
             return resp.cookies
@@ -106,7 +106,7 @@ class AiChatAPI:
         if options:
             body["options"] = options
             body["multi_select"] = multi_select
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(f"{self.base_url}{path}", json=body, headers=headers)
             resp.raise_for_status()
             return resp.json()
@@ -116,12 +116,31 @@ class AiChatAPI:
         path = "/api/event"
         headers = self._sign_request("POST", path)
         headers["Content-Type"] = "application/json"
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{self.base_url}{path}",
                 json={"event_type": event_type},
                 headers=headers,
                 timeout=5,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def report_directories(
+        self,
+        working_directory: str,
+        additional_directories: list[str] | None = None,
+    ) -> dict:
+        """POST /api/directories — report working directory to server."""
+        path = "/api/directories"
+        headers = self._sign_request("POST", path)
+        headers["Content-Type"] = "application/json"
+        body: dict = {"working_directory": working_directory}
+        if additional_directories:
+            body["additional_directories"] = additional_directories
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{self.base_url}{path}", json=body, headers=headers
             )
             resp.raise_for_status()
             return resp.json()
