@@ -169,6 +169,17 @@ def _parse_sse_event(line: str, channel_id: str | None) -> dict | None:
             "attachments": event.get("attachments", []),
         }
 
+    # Plan mode events → message queue
+    if (
+        event_type == "aichat:message"
+        and event.get("sender") == "event"
+        and event.get("content", "").startswith("plan:")
+    ):
+        return {
+            "_event_type": "plan",
+            "content": event.get("content", ""),
+        }
+
     # Interaction responses → interaction manager
     if event_type == "aichat:interaction-response":
         return {
@@ -204,6 +215,10 @@ async def listen_sse(
                         if event_type == "message":
                             log.info("SSE: received message from Zech")
                             interactions.cancel_all()
+                            await message_queue.put(event_data)
+
+                        elif event_type == "plan":
+                            log.info("SSE: plan event: %s", event_data.get("content"))
                             await message_queue.put(event_data)
 
                         elif event_type == "interaction-response":
@@ -285,8 +300,16 @@ async def run_agent(
                 await handle_response_message(message, api)
 
             # Main loop: wait for incoming messages
+            pending_plan_event = None
             while True:
                 msg_data = await message_queue.get()
+
+                # Plan events: buffer and wait for the next user message
+                if msg_data.get("content", "").startswith("plan:"):
+                    pending_plan_event = msg_data.get("content")
+                    log.info("Buffered plan event: %s", pending_plan_event)
+                    continue
+
                 log.info("Processing incoming message")
                 content = msg_data.get("content", "")
                 message_id = msg_data.get("message_id")
@@ -320,6 +343,14 @@ async def run_agent(
                 prompt = f"New message from Zech:\n{content}"
                 if attachment_notes:
                     prompt += "\n\n" + "\n".join(attachment_notes)
+
+                # Inject plan mode instruction if a plan event was buffered
+                if pending_plan_event:
+                    if pending_plan_event == "plan:enter":
+                        prompt += "\n\n[System: The user has activated planning mode. Use /plan to enter plan mode before responding.]"
+                    elif pending_plan_event == "plan:exit":
+                        prompt += "\n\n[System: The user has deactivated planning mode.]"
+                    pending_plan_event = None
 
                 await client.query(prompt)
                 async for message in client.receive_response():
