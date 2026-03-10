@@ -257,9 +257,6 @@ async def run_agent(
             # Determine initial prompt
             sse_context = (
                 "IMPORTANT: You are communicating with the user through a chat interface.\n"
-                "- Messages from the user are delivered to you automatically — "
-                "do NOT set up cron jobs, /loop, or polling for messages.\n"
-                "- Do NOT run aichat-unread or aichat-read CLI commands.\n"
                 "- The user CANNOT see your text responses. The ONLY way to communicate "
                 "with the user is by calling the mcp__aichat__send tool. "
                 "Every time you want to tell the user something, you MUST call "
@@ -267,8 +264,12 @@ async def run_agent(
                 "and assume the user will see it.\n"
                 "- This is a casual chat. Be concise and human. Don't narrate your "
                 "thought process or explain what you're about to do — just do it. "
-                "Don't detail plans, don't announce tool calls, don't summarize "
-                "what you just asked. Keep messages short and natural.\n\n"
+                "Keep messages short and natural.\n"
+                "- For complex tasks, use planning mode instead of detailing plans "
+                "in chat messages.\n"
+                "- When you have a yes/no question or a question with 2-3 clear options, "
+                "use the AskUserQuestion tool to present choices instead of asking "
+                "in a chat message.\n\n"
             )
             if initial_prompt:
                 prompt = sse_context + initial_prompt
