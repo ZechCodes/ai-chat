@@ -11,18 +11,6 @@ Use this to:
 - Send periodic status updates
 - Ask Zech questions or report issues
 
-### `aichat-unread` — Read unread messages from Zech
-```
-aichat-unread
-```
-Use this to check for new instructions or replies. Run on startup and periodically (set up `/loop 1m check for new messages`).
-
-### `aichat-read` — Read recent message history
-```
-aichat-read [limit]
-```
-Use this to review conversation context. Optional `limit` argument controls how many messages to fetch.
-
 ### `aichat-register` — Register a token for a directory
 ```
 aichat-register TOKEN [DIRECTORY]
@@ -47,10 +35,5 @@ See [PLAN-device-manager.md](./PLAN-device-manager.md) for the implementation pl
 
 ## Rules
 
-Never use plan mode. It is imperative that you do not use plan mode. Zech may
-not be available to approve your plan and you'll be unable to communicate with
-him while you're awaiting approval.
-
 When you first start up and when you finish a task use aichat-send to
-tell Zech. Periodically send updates to Zech and use aichat-unread to
-check for new messages.
+tell Zech.
