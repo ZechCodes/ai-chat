@@ -264,7 +264,11 @@ async def run_agent(
                 "with the user is by calling the mcp__aichat__send tool. "
                 "Every time you want to tell the user something, you MUST call "
                 "mcp__aichat__send. Never just write a text response "
-                "and assume the user will see it.\n\n"
+                "and assume the user will see it.\n"
+                "- This is a casual chat. Be concise and human. Don't narrate your "
+                "thought process or explain what you're about to do — just do it. "
+                "Don't detail plans, don't announce tool calls, don't summarize "
+                "what you just asked. Keep messages short and natural.\n\n"
             )
             if initial_prompt:
                 prompt = sse_context + initial_prompt
