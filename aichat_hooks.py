@@ -39,8 +39,6 @@ def _describe_tool(tool_name: str, tool_input: dict) -> str:
         return f"Writing {os.path.basename(path)}" if path else "Writing file"
     if tool_name == "Bash":
         cmd = tool_input.get("command", "")
-        if len(cmd) > 60:
-            cmd = cmd[:57] + "..."
         return f"Running: {cmd}" if cmd else "Running command"
     if tool_name == "Glob":
         pattern = tool_input.get("pattern", "")
