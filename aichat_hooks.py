@@ -244,6 +244,27 @@ def make_pre_tool_hook(api: AiChatAPI, hook_state: dict):
     return hook
 
 
+def _format_edit_diff(tool_input: dict) -> str | None:
+    """Format an Edit tool's old_string/new_string as a unified diff description."""
+    old = tool_input.get("old_string", "")
+    new = tool_input.get("new_string", "")
+    path = tool_input.get("file_path", "")
+    if not old and not new:
+        return None
+
+    filename = os.path.basename(path) if path else "file"
+    lines = [f"diff:{filename}"]
+    old_lines = old.splitlines()
+    new_lines = new.splitlines()
+
+    for line in old_lines:
+        lines.append(f"-{line}")
+    for line in new_lines:
+        lines.append(f"+{line}")
+
+    return "\n".join(lines)
+
+
 def make_post_tool_hook(api: AiChatAPI):
     """Create a PostToolUse hook that reports done status."""
 
@@ -255,6 +276,12 @@ def make_post_tool_hook(api: AiChatAPI):
             return {}
         if _is_own_api_call(tool_name, tool_input):
             return {}
+
+        # Send edit diff before marking done
+        if tool_name == "Edit":
+            diff_desc = _format_edit_diff(tool_input)
+            if diff_desc:
+                await api.send_tool_status("active", tool="Edit", description=diff_desc)
 
         await api.send_tool_status("done", tool=tool_name)
         return {}
