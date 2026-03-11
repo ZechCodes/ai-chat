@@ -1,5 +1,9 @@
-"""AI.CHAT Device Manager — authenticates device, receives commands via SSE,
-launches and monitors Agent SDK worker processes per channel.
+"""AI.CHAT Device Manager — authenticates device, connects to server via
+WebSocket, launches and monitors Agent SDK worker processes per channel.
+
+Workers communicate exclusively through the manager via IPC (Unix domain sockets).
+The manager proxies their API requests to the server over a single WebSocket and
+forwards incoming notification events to the appropriate worker.
 
 Usage:
     uv run python3 aichat_manager.py
@@ -14,10 +18,13 @@ import os
 import platform
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 
 import httpx
+import websockets
 
+from aichat_api import AiChatAPI
 from aichat_device_auth import (
     DeviceConfig,
     generate_device_keypair,
@@ -25,6 +32,19 @@ from aichat_device_auth import (
     poll_for_approval,
     register_device,
     save_device_config,
+)
+from aichat_ipc import (
+    IPCServer,
+    MSG_SEND_MESSAGE,
+    MSG_TOOL_STATUS,
+    MSG_MARK_READ,
+    MSG_CREATE_INTERACTION,
+    MSG_SEND_EVENT,
+    MSG_REPORT_DIRECTORIES,
+    MSG_DOWNLOAD_ATTACHMENT,
+    MSG_EVENT_MESSAGE,
+    MSG_EVENT_PLAN,
+    MSG_EVENT_INTERACTION_RESPONSE,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -59,6 +79,51 @@ def parse_device_command(event: dict) -> dict | None:
     }
 
 
+def _parse_worker_event(event: dict, channel_id: str) -> dict | None:
+    """Parse a notification event into an IPC message for a worker, or None if irrelevant."""
+    # Only forward events for this channel
+    if event.get("channel_id") and event.get("channel_id") != channel_id:
+        return None
+
+    event_type = event.get("type")
+
+    # User messages
+    if event_type == "aichat:message" and event.get("sender") == "user":
+        return {
+            "type": MSG_EVENT_MESSAGE,
+            "channel_id": channel_id,
+            "message_id": event.get("message_id"),
+            "content": event.get("content", ""),
+            "sender": "user",
+            "attachments": event.get("attachments", []),
+        }
+
+    # Plan mode events
+    if (
+        event_type == "aichat:message"
+        and event.get("sender") == "event"
+        and event.get("content", "").startswith("plan:")
+    ):
+        return {
+            "type": MSG_EVENT_PLAN,
+            "channel_id": channel_id,
+            "content": event.get("content", ""),
+        }
+
+    # Interaction responses
+    if event_type == "aichat:interaction-response":
+        return {
+            "type": MSG_EVENT_INTERACTION_RESPONSE,
+            "channel_id": channel_id,
+            "interaction_id": event.get("interaction_id"),
+            "action": event.get("action"),
+            "answer": event.get("answer", ""),
+            "reason": event.get("reason", ""),
+        }
+
+    return None
+
+
 class DeviceManager:
     """Manages worker processes on this device."""
 
@@ -68,6 +133,231 @@ class DeviceManager:
         self.base_url = base_url
         self.workers: dict[str, WorkerProcess] = {}
         self.last_event_ts: str | None = None
+
+        # IPC server (initialized in start_ipc())
+        self.ipc: IPCServer | None = None
+        self.ipc_socket_path: str = f"/tmp/aichat-{device_id}.sock"
+
+        # WebSocket connection state
+        self._ws: websockets.WebSocketClientProtocol | None = None
+        self._ws_pending: dict[str, asyncio.Future] = {}  # rid → Future
+        self._ws_lock = asyncio.Lock()  # serialize sends
+
+    # ------------------------------------------------------------------
+    # WebSocket communication
+    # ------------------------------------------------------------------
+
+    async def connect_websocket(self) -> None:
+        """Connect to server via WebSocket with automatic reconnection."""
+        backoff = 1
+        while True:
+            try:
+                headers = self._sign_request("GET", "/api/device/ws")
+                ws_url = self.base_url.replace("https://", "wss://").replace("http://", "ws://")
+                ws_url += "/api/device/ws"
+
+                log.info("Connecting to WebSocket at %s ...", ws_url)
+                async with websockets.connect(
+                    ws_url, additional_headers=headers,
+                ) as ws:
+                    self._ws = ws
+                    backoff = 1  # reset on successful connect
+                    log.info("WebSocket connected")
+
+                    # Initial sync after (re)connect
+                    await self.report_status()
+                    await self.sync_channels()
+
+                    # Read loop
+                    async for raw in ws:
+                        try:
+                            msg = json.loads(raw)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+
+                        msg_type = msg.get("type")
+
+                        if msg_type == "response":
+                            rid = msg.get("rid")
+                            future = self._ws_pending.pop(rid, None) if rid else None
+                            if future and not future.done():
+                                future.set_result(msg)
+                            continue
+
+                        if msg_type == "event":
+                            await self._handle_ws_event(msg)
+                            continue
+
+                        log.warning("Unknown WS message type: %s", msg_type)
+
+            except Exception as e:
+                log.warning("WebSocket error: %s, reconnecting in %ds", e, backoff)
+                self._ws = None
+                # Fail all pending requests
+                for future in self._ws_pending.values():
+                    if not future.done():
+                        future.set_exception(ConnectionError("WebSocket disconnected"))
+                self._ws_pending.clear()
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+
+    async def _ws_request(self, msg: dict, timeout: float = 30.0) -> dict:
+        """Send a request over WebSocket and await the correlated response."""
+        if not self._ws:
+            raise ConnectionError("WebSocket not connected")
+
+        rid = uuid.uuid4().hex[:12]
+        msg["rid"] = rid
+
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._ws_pending[rid] = future
+
+        try:
+            async with self._ws_lock:
+                await self._ws.send(json.dumps(msg))
+            result = await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._ws_pending.pop(rid, None)
+            raise TimeoutError(f"WS request timed out: {msg.get('type')}")
+
+        if not result.get("ok"):
+            raise RuntimeError(f"WS request failed: {result.get('error')}")
+        return result.get("data", {})
+
+    async def _ws_fire_and_forget(self, msg: dict) -> None:
+        """Send a message over WebSocket without awaiting a response."""
+        if not self._ws:
+            return  # Silently drop if not connected (e.g. tool_status during reconnect)
+        try:
+            async with self._ws_lock:
+                await self._ws.send(json.dumps(msg))
+        except Exception:
+            pass  # Best-effort for fire-and-forget
+
+    async def _handle_ws_event(self, event: dict) -> None:
+        """Handle a notification event received over WebSocket."""
+        # Device commands → handle locally
+        cmd = parse_device_command(event)
+        if cmd:
+            log.info("Received command: %s", cmd["command"])
+            await self.handle_command(cmd)
+            return
+
+        # Track timestamp for potential replay
+        if "timestamp" in event:
+            self.last_event_ts = event["timestamp"]
+
+        # Forward worker-relevant events via IPC
+        if self.ipc:
+            await self._forward_event_to_worker(event)
+
+    # ------------------------------------------------------------------
+    # IPC: worker request proxying
+    # ------------------------------------------------------------------
+
+    async def _handle_worker_request(self, channel_id: str, msg: dict) -> dict:
+        """Handle a request from a worker, proxying it to the server via WebSocket."""
+        msg_type = msg.get("type")
+
+        if msg_type == MSG_SEND_MESSAGE:
+            return await self._ws_request({
+                "type": "send_message",
+                "channel_id": channel_id,
+                "content": msg["content"],
+            })
+
+        if msg_type == MSG_TOOL_STATUS:
+            await self._ws_fire_and_forget({
+                "type": "tool_status",
+                "channel_id": channel_id,
+                "status": msg.get("status", ""),
+                "tool": msg.get("tool", ""),
+                "description": msg.get("description", ""),
+            })
+            return {}
+
+        if msg_type == MSG_MARK_READ:
+            return await self._ws_request({
+                "type": "mark_read",
+                "channel_id": channel_id,
+                "message_ids": msg.get("message_ids", []),
+            })
+
+        if msg_type == MSG_CREATE_INTERACTION:
+            return await self._ws_request({
+                "type": "create_interaction",
+                "channel_id": channel_id,
+                "interaction_type": msg["interaction_type"],
+                "content": msg["content"],
+                "options": msg.get("options"),
+                "multi_select": msg.get("multi_select", False),
+            })
+
+        if msg_type == MSG_SEND_EVENT:
+            return await self._ws_request({
+                "type": "send_event",
+                "channel_id": channel_id,
+                "event_type": msg["event_type"],
+            })
+
+        if msg_type == MSG_REPORT_DIRECTORIES:
+            return await self._ws_request({
+                "type": "report_directories",
+                "channel_id": channel_id,
+                "working_directory": msg["working_directory"],
+                "additional_directories": msg.get("additional_directories"),
+            })
+
+        if msg_type == MSG_DOWNLOAD_ATTACHMENT:
+            # Attachment downloads stay as HTTP (binary data not suited for WS JSON)
+            api = self._get_download_client(channel_id)
+            path = await api.download_attachment(msg["url"])
+            return {"path": path}
+
+        log.warning("IPC: unknown request type from worker: %s", msg_type)
+        raise ValueError(f"Unknown request type: {msg_type}")
+
+    def _get_download_client(self, channel_id: str) -> AiChatAPI:
+        """Get a minimal AiChatAPI client for binary downloads."""
+        return AiChatAPI(
+            base_url=self.base_url,
+            device_key=self.private_key_b64,
+            device_id=self.device_id,
+            channel_id=channel_id,
+        )
+
+    # ------------------------------------------------------------------
+    # IPC server lifecycle
+    # ------------------------------------------------------------------
+
+    async def start_ipc(self) -> None:
+        """Start the IPC server."""
+        self.ipc = IPCServer(
+            socket_path=self.ipc_socket_path,
+            on_request=self._handle_worker_request,
+        )
+        await self.ipc.start()
+
+    async def stop_ipc(self) -> None:
+        """Stop the IPC server."""
+        if self.ipc:
+            await self.ipc.stop()
+
+    async def _forward_event_to_worker(self, event: dict) -> None:
+        """Forward a notification event to the appropriate worker via IPC."""
+        if not self.ipc:
+            return
+
+        for channel_id in self.ipc.connected_channels:
+            ipc_msg = _parse_worker_event(event, channel_id)
+            if ipc_msg:
+                sent = await self.ipc.send_to_worker(channel_id, ipc_msg)
+                if sent:
+                    log.debug("Forwarded %s event to worker %s", ipc_msg["type"], channel_id)
+
+    # ------------------------------------------------------------------
+    # Worker management
+    # ------------------------------------------------------------------
 
     def _save_worker_pids(self) -> None:
         """Persist current worker PIDs to device config."""
@@ -102,9 +392,9 @@ class DeviceManager:
     ) -> None:
         """Launch a worker subprocess for the given channel.
 
-        Workers authenticate with the device's private key + channel_id.
-        The channel_token parameter is kept for backward compat with SSE commands
-        but is no longer used for auth.
+        Workers communicate with the manager via IPC. The device auth env vars
+        are still set for any direct CLI tool usage, but the agent process itself
+        uses the IPC socket for all server communication.
         """
         # Stop existing worker for this channel if any
         if channel_id in self.workers:
@@ -134,6 +424,7 @@ class DeviceManager:
             "--device-id", self.device_id,
             "--channel-id", channel_id,
             "--base-url", self.base_url,
+            "--ipc-socket", self.ipc_socket_path,
         ]
         if working_directory:
             cmd.extend(["--working-directory", working_directory])
@@ -200,10 +491,13 @@ class DeviceManager:
         else:
             log.warning("Unknown command: %s", command)
 
+    # ------------------------------------------------------------------
+    # Status & sync
+    # ------------------------------------------------------------------
+
     def _get_worker_memory_mb(self, pid: int) -> float | None:
         """Get RSS memory usage for a worker process in MB."""
         try:
-            # /proc/{pid}/statm on Linux, ps on macOS
             if sys.platform == "darwin":
                 import subprocess
                 result = subprocess.run(
@@ -244,25 +538,9 @@ class DeviceManager:
         }
 
     async def sync_channels(self) -> None:
-        """Query server for assigned channels and reconcile with running workers.
-
-        On startup this also cleans up stale worker processes from a previous
-        manager run by reading saved PIDs from device config. The flow:
-        1. Fetch assigned channels from server
-        2. Kill stale PIDs for channels no longer assigned
-        3. Stop live workers for channels no longer assigned
-        4. Start workers for channels not yet running
-        """
+        """Query server for assigned channels and reconcile with running workers."""
         try:
-            headers = self._sign_request("GET", "/api/device/channels")
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    f"{self.base_url}/api/device/channels",
-                    headers=headers,
-                    timeout=10,
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            data = await self._ws_request({"type": "list_channels"})
         except Exception as e:
             log.warning("Failed to fetch device channels: %s", e)
             return
@@ -304,18 +582,13 @@ class DeviceManager:
             await self.start_worker(channel_id, working_directory=working_directory)
 
     async def report_status(self) -> None:
-        """Report device status to the server."""
+        """Report device status to the server via WebSocket."""
         status = self.get_status()
         try:
-            headers = self._sign_request("POST", "/api/device/status")
-            headers["Content-Type"] = "application/json"
-            async with httpx.AsyncClient() as client:
-                await client.post(
-                    f"{self.base_url}/api/device/status",
-                    json=status,
-                    headers=headers,
-                    timeout=10,
-                )
+            await self._ws_request({
+                "type": "report_status",
+                **status,
+            })
         except Exception as e:
             log.warning("Failed to report status: %s", e)
 
@@ -337,6 +610,10 @@ class DeviceManager:
             "X-Device-Id": self.device_id,
         }
 
+    # ------------------------------------------------------------------
+    # Worker monitoring
+    # ------------------------------------------------------------------
+
     async def _check_workers(self) -> None:
         """Check for crashed workers and restart them."""
         for channel_id, worker in list(self.workers.items()):
@@ -350,78 +627,16 @@ class DeviceManager:
             await self._check_workers()
             await asyncio.sleep(5)
 
-    async def listen_sse(self, cookies: httpx.Cookies) -> None:
-        """Listen to Skrift notification stream for device commands."""
-        while True:
-            try:
-                url = f"{self.base_url}/notifications/stream"
-                if self.last_event_ts:
-                    url += f"?since={self.last_event_ts}"
-
-                log.info("Connecting to SSE stream...")
-                async with httpx.AsyncClient(
-                    cookies=cookies,
-                    timeout=httpx.Timeout(None, connect=10),
-                ) as client:
-                    async with client.stream("GET", url) as response:
-                        async for line in response.aiter_lines():
-                            if not line.startswith("data:"):
-                                continue
-                            try:
-                                event = json.loads(line[5:].strip())
-                            except (json.JSONDecodeError, ValueError):
-                                continue
-
-                            # Track timestamp for reconnect replay
-                            if "timestamp" in event:
-                                self.last_event_ts = event["timestamp"]
-
-                            cmd = parse_device_command(event)
-                            if cmd:
-                                log.info("Received command: %s", cmd["command"])
-                                await self.handle_command(cmd)
-
-            except httpx.HTTPError as e:
-                log.warning("SSE connection error: %s, reconnecting in 5s", e)
-                await asyncio.sleep(5)
-            except Exception as e:
-                log.error("SSE unexpected error: %s, reconnecting in 10s", e)
-                await asyncio.sleep(10)
+    # ------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------
 
     async def shutdown(self) -> None:
-        """Gracefully stop all workers."""
+        """Gracefully stop all workers and IPC server."""
         log.info("Shutting down, stopping %d workers", len(self.workers))
         for channel_id in list(self.workers.keys()):
             await self.stop_worker(channel_id)
-
-
-async def get_session_for_device(config: DeviceConfig) -> httpx.Cookies:
-    """Exchange device auth for a session cookie.
-
-    Uses the device's Ed25519 key to sign a request to POST /api/device/session,
-    getting back a session cookie for SSE stream access.
-    """
-    import base64
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-    key_bytes = base64.b64decode(config.private_key_b64)
-    private_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
-
-    path = "/api/device/session"
-    timestamp = str(int(time.time()))
-    message = f"{timestamp}.POST.{path}".encode()
-    signature = private_key.sign(message)
-
-    headers = {
-        "X-Timestamp": timestamp,
-        "X-Signature": base64.b64encode(signature).decode(),
-        "X-Device-Id": config.device_id,
-    }
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(f"{config.base_url}{path}", headers=headers)
-        resp.raise_for_status()
-        return resp.cookies
+        await self.stop_ipc()
 
 
 async def device_auth_flow(base_url: str) -> DeviceConfig:
@@ -479,31 +694,21 @@ async def run_manager() -> None:
 
     log.info("Device: %s (%s)", config.device_name, config.device_id)
 
-    # Get session cookie for SSE, re-register on 401
-    try:
-        cookies = await get_session_for_device(config)
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 401:
-            log.warning("Device auth failed (401), re-registering...")
-            config = await device_auth_flow(base_url)
-            cookies = await get_session_for_device(config)
-        else:
-            raise
-
     manager = DeviceManager(
         device_id=config.device_id,
         private_key_b64=config.private_key_b64,
         base_url=config.base_url,
     )
 
-    # Report online and sync channels (also cleans up stale workers)
-    await manager.report_status()
-    await manager.sync_channels()
+    # Start IPC server before connecting WebSocket
+    await manager.start_ipc()
 
     try:
-        # Run SSE listener and worker monitor concurrently
+        # WebSocket connection loop and worker monitor run concurrently.
+        # connect_websocket handles initial sync (report_status + sync_channels)
+        # on each (re)connect.
         async with asyncio.TaskGroup() as tg:
-            tg.create_task(manager.listen_sse(cookies))
+            tg.create_task(manager.connect_websocket())
             tg.create_task(manager.monitor_workers())
     except KeyboardInterrupt:
         pass
