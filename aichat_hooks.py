@@ -6,11 +6,18 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from aichat_api import AiChatAPI
     from aichat_interactions import InteractionManager
+
+
+class ChatAPI(Protocol):
+    """Protocol for the API used by hooks — satisfied by both AiChatAPI and IPCClient."""
+
+    async def send_tool_status(self, status: str, tool: str = "", description: str = "") -> None: ...
+    async def create_interaction(self, interaction_type: str, content: str, *, options: list[dict] | None = None, multi_select: bool = False) -> dict: ...
+    async def send_event(self, event_type: str) -> dict: ...
 
 log = logging.getLogger(__name__)
 
@@ -113,7 +120,7 @@ def _deny(input_data, reason: str):
     }
 
 
-def make_interaction_hook(api: AiChatAPI, interactions: InteractionManager):
+def make_interaction_hook(api: ChatAPI, interactions: InteractionManager):
     """Create a PreToolUse hook that intercepts AskUserQuestion.
 
     Sends the interaction to the web UI via the server and blocks until
@@ -159,7 +166,7 @@ def make_interaction_hook(api: AiChatAPI, interactions: InteractionManager):
     return hook
 
 
-def make_can_use_tool(api: AiChatAPI, interactions: InteractionManager, hook_state: dict):
+def make_can_use_tool(api: ChatAPI, interactions: InteractionManager, hook_state: dict):
     """Create a can_use_tool callback for ClaudeAgentOptions.
 
     The CLI dispatches ExitPlanMode (and other permission-gated tools) through
@@ -208,7 +215,7 @@ def make_can_use_tool(api: AiChatAPI, interactions: InteractionManager, hook_sta
                 log.warning("Failed to send plan:exit event")
             return PermissionResultAllow()
 
-        reason = response.get("reason", "User rejected the plan.")
+        reason = response.get("reason") or "User rejected the plan."
         try:
             await api.send_event("plan:exit")
         except Exception:
@@ -218,7 +225,7 @@ def make_can_use_tool(api: AiChatAPI, interactions: InteractionManager, hook_sta
     return callback
 
 
-def make_pre_tool_hook(api: AiChatAPI, hook_state: dict):
+def make_pre_tool_hook(api: ChatAPI, hook_state: dict):
     """Create a PreToolUse hook that reports active status and tracks writes."""
 
     async def hook(input_data, tool_use_id, context):
@@ -265,7 +272,7 @@ def _format_edit_diff(tool_input: dict) -> str | None:
     return "\n".join(lines)
 
 
-def make_post_tool_hook(api: AiChatAPI):
+def make_post_tool_hook(api: ChatAPI):
     """Create a PostToolUse hook that reports done status."""
 
     async def hook(input_data, tool_use_id, context):
@@ -289,7 +296,7 @@ def make_post_tool_hook(api: AiChatAPI):
     return hook
 
 
-def make_stop_hook(api: AiChatAPI):
+def make_stop_hook(api: ChatAPI):
     """Create a Stop hook that reports idle status."""
 
     async def hook(input_data, tool_use_id, context):
@@ -299,7 +306,7 @@ def make_stop_hook(api: AiChatAPI):
     return hook
 
 
-def make_pre_compact_hook(api: AiChatAPI):
+def make_pre_compact_hook(api: ChatAPI):
     """Create a PreCompact hook that notifies when context compaction starts."""
 
     async def hook(input_data, tool_use_id, context):
