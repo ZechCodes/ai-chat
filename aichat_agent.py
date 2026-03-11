@@ -122,12 +122,14 @@ def build_agent_options(
     )
 
 
-async def handle_response_message(message, api: AiChatAPI) -> None:
+async def handle_response_message(message, api: AiChatAPI) -> str | None:
     """Report agent response messages as reasoning tool status.
 
     AssistantMessage text blocks are internal narration (explicit aichat-send
     calls handle real messages to the user), so they're sent as tool status
     updates rather than chat messages.
+
+    Returns the text content if any (used by /compact to capture summaries).
     """
     if isinstance(message, AssistantMessage):
         text_parts = [
@@ -135,11 +137,41 @@ async def handle_response_message(message, api: AiChatAPI) -> None:
             if isinstance(block, TextBlock)
         ]
         if text_parts:
+            text = "\n".join(text_parts)
             await api.send_tool_status(
                 status="active",
                 tool="reasoning",
-                description="\n".join(text_parts),
+                description=text,
             )
+            return text
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Slash commands: /clear and /compact
+# ---------------------------------------------------------------------------
+
+COMPACT_PROMPT = (
+    "Context is about to be reset. Before that happens, provide a detailed "
+    "summary for your successor agent covering:\n"
+    "- What we've worked on this session (tasks completed, in-progress, and abandoned)\n"
+    "- Any directives or preferences the user expressed that should carry forward\n"
+    "- Current task status and next steps\n"
+    "- Relevant project architecture and patterns discovered\n"
+    "- Key file paths and code locations referenced\n"
+    "- Any decisions made and their rationale\n\n"
+    "Write this as a context briefing — your replacement will receive it as their "
+    "starting context. Be thorough. Do NOT use the aichat_send tool — just write "
+    "your summary as a direct text response."
+)
+
+
+def _parse_slash_command(content: str) -> str | None:
+    """Return the slash command name if the message is a slash command, else None."""
+    stripped = content.strip().lower()
+    if stripped in ("/clear", "/compact"):
+        return stripped
+    return None
 
 
 def _parse_sse_event(line: str, channel_id: str | None) -> dict | None:
@@ -235,6 +267,24 @@ async def listen_sse(
             await asyncio.sleep(10)
 
 
+SSE_CONTEXT = (
+    "IMPORTANT: You are communicating with the user through a chat interface.\n"
+    "- The user CANNOT see your text responses. The ONLY way to communicate "
+    "with the user is by calling the mcp__aichat__send tool. "
+    "Every time you want to tell the user something, you MUST call "
+    "mcp__aichat__send. Never just write a text response "
+    "and assume the user will see it.\n"
+    "- This is a casual chat. Be concise and human. Don't narrate your "
+    "thought process or explain what you're about to do — just do it. "
+    "Keep messages short and natural.\n"
+    "- For complex tasks, use planning mode instead of detailing plans "
+    "in chat messages.\n"
+    "- When you have a yes/no question or a question with 2-3 clear options, "
+    "use the AskUserQuestion tool to present choices instead of asking "
+    "in a chat message.\n\n"
+)
+
+
 async def run_agent(
     initial_prompt: str | None = None,
     token: str | None = None,
@@ -243,7 +293,7 @@ async def run_agent(
     channel_id: str | None = None,
     base_url: str | None = None,
 ) -> None:
-    """Main agent loop."""
+    """Main agent loop with support for /clear and /compact context resets."""
     api = AiChatAPI(
         token=token,
         device_key=device_key,
@@ -252,7 +302,6 @@ async def run_agent(
         base_url=base_url,
     )
     interactions = InteractionManager()
-    options = build_agent_options(api, interactions)
     message_queue: asyncio.Queue[dict] = asyncio.Queue()
 
     # Report working directory to server
@@ -266,95 +315,135 @@ async def run_agent(
     await api.send_message("Agent online.")
     log.info("Agent started, channel=%s, cwd=%s", api.channel_id, cwd)
 
-    # Start SSE listener
+    # Start SSE listener (persists across context resets)
     sse_task = asyncio.create_task(listen_sse(message_queue, interactions, api))
 
+    # next_prompt carries context across resets (None = default check-in)
+    next_prompt: str | None = initial_prompt
+
     try:
-        async with ClaudeSDKClient(options=options) as client:
-            # Determine initial prompt
-            sse_context = (
-                "IMPORTANT: You are communicating with the user through a chat interface.\n"
-                "- The user CANNOT see your text responses. The ONLY way to communicate "
-                "with the user is by calling the mcp__aichat__send tool. "
-                "Every time you want to tell the user something, you MUST call "
-                "mcp__aichat__send. Never just write a text response "
-                "and assume the user will see it.\n"
-                "- This is a casual chat. Be concise and human. Don't narrate your "
-                "thought process or explain what you're about to do — just do it. "
-                "Keep messages short and natural.\n"
-                "- For complex tasks, use planning mode instead of detailing plans "
-                "in chat messages.\n"
-                "- When you have a yes/no question or a question with 2-3 clear options, "
-                "use the AskUserQuestion tool to present choices instead of asking "
-                "in a chat message.\n\n"
-            )
-            if initial_prompt:
-                prompt = sse_context + initial_prompt
-            else:
-                prompt = sse_context + "Check in with Zech."
+        # Outer loop: each iteration is a fresh agent context
+        while True:
+            options = build_agent_options(api, interactions)
+            reset_reason: str | None = None
 
-            # Initial query
-            log.info("Sending initial prompt to agent")
-            await client.query(prompt)
-            async for message in client.receive_response():
-                await handle_response_message(message, api)
+            async with ClaudeSDKClient(options=options) as client:
+                if next_prompt:
+                    prompt = SSE_CONTEXT + next_prompt
+                else:
+                    prompt = SSE_CONTEXT + "Check in with Zech."
+                next_prompt = None  # consumed
 
-            # Main loop: wait for incoming messages
-            pending_plan_event = None
-            while True:
-                msg_data = await message_queue.get()
-
-                # Plan events: buffer and wait for the next user message
-                if msg_data.get("content", "").startswith("plan:"):
-                    pending_plan_event = msg_data.get("content")
-                    log.info("Buffered plan event: %s", pending_plan_event)
-                    continue
-
-                log.info("Processing incoming message")
-                content = msg_data.get("content", "")
-                message_id = msg_data.get("message_id")
-                attachments = msg_data.get("attachments", [])
-
-                # Mark as read now that we're delivering it to Claude
-                if message_id:
-                    try:
-                        await api.mark_read([message_id])
-                    except Exception as e:
-                        log.warning("Failed to mark message read: %s", e)
-
-                # Download image attachments to temp files for Claude to view
-                attachment_notes = []
-                for att in attachments:
-                    ct = att.get("content_type", "")
-                    if ct.startswith("image/"):
-                        try:
-                            img_path = await api.download_attachment(att["url"])
-                            attachment_notes.append(
-                                f"[Image attached: {att.get('filename', 'image')} — "
-                                f"saved to {img_path}, use Read tool to view it]"
-                            )
-                        except Exception as e:
-                            log.warning("Failed to download attachment: %s", e)
-                            attachment_notes.append(
-                                f"[Image: {att.get('filename', 'image')} — "
-                                f"download failed: {e}]"
-                            )
-
-                prompt = f"New message from Zech:\n{content}"
-                if attachment_notes:
-                    prompt += "\n\n" + "\n".join(attachment_notes)
-
-                # Inject plan mode instruction if a plan event was buffered
-                if pending_plan_event:
-                    if pending_plan_event == "plan:enter":
-                        prompt += "\n\n[System: The user has activated planning mode. Use /plan to enter plan mode before responding.]"
-                    elif pending_plan_event == "plan:exit":
-                        prompt += "\n\n[System: The user has deactivated planning mode.]"
-                    pending_plan_event = None
-
+                # Initial query
+                log.info("Sending initial prompt to agent")
                 await client.query(prompt)
                 async for message in client.receive_response():
                     await handle_response_message(message, api)
+
+                # Message loop
+                pending_plan_event = None
+                while True:
+                    msg_data = await message_queue.get()
+
+                    # Plan events: buffer and wait for the next user message
+                    if msg_data.get("content", "").startswith("plan:"):
+                        pending_plan_event = msg_data.get("content")
+                        log.info("Buffered plan event: %s", pending_plan_event)
+                        continue
+
+                    log.info("Processing incoming message")
+                    content = msg_data.get("content", "")
+                    message_id = msg_data.get("message_id")
+                    attachments = msg_data.get("attachments", [])
+
+                    # Mark as read
+                    if message_id:
+                        try:
+                            await api.mark_read([message_id])
+                        except Exception as e:
+                            log.warning("Failed to mark message read: %s", e)
+
+                    # --- Slash command handling ---
+                    command = _parse_slash_command(content)
+
+                    if command == "/clear":
+                        log.info("Slash command: /clear — resetting context")
+                        await api.send_message("Context cleared.")
+                        next_prompt = None
+                        reset_reason = "clear"
+                        break
+
+                    if command == "/compact":
+                        log.info("Slash command: /compact — summarizing then resetting")
+                        await api.send_tool_status(
+                            status="active",
+                            tool="compact",
+                            description="Compacting context...",
+                        )
+
+                        # Ask current agent to summarize the session
+                        await client.query(COMPACT_PROMPT)
+                        summary_parts = []
+                        async for message in client.receive_response():
+                            text = await handle_response_message(message, api)
+                            if text:
+                                summary_parts.append(text)
+
+                        summary = "\n".join(summary_parts)
+                        if summary.strip():
+                            next_prompt = (
+                                "You are resuming work after a context compaction. "
+                                "Here is a summary from the previous context:\n\n"
+                                f"{summary}\n\n"
+                                "Continue from where things left off. Check in with Zech."
+                            )
+                            log.info("Compact summary captured (%d chars)", len(summary))
+                        else:
+                            log.warning("Compact produced no summary, starting fresh")
+                            next_prompt = None
+
+                        await api.send_message("Context compacted.")
+                        reset_reason = "compact"
+                        break
+
+                    # --- Normal message processing ---
+
+                    # Download image attachments to temp files for Claude to view
+                    attachment_notes = []
+                    for att in attachments:
+                        ct = att.get("content_type", "")
+                        if ct.startswith("image/"):
+                            try:
+                                img_path = await api.download_attachment(att["url"])
+                                attachment_notes.append(
+                                    f"[Image attached: {att.get('filename', 'image')} — "
+                                    f"saved to {img_path}, use Read tool to view it]"
+                                )
+                            except Exception as e:
+                                log.warning("Failed to download attachment: %s", e)
+                                attachment_notes.append(
+                                    f"[Image: {att.get('filename', 'image')} — "
+                                    f"download failed: {e}]"
+                                )
+
+                    prompt = f"New message from Zech:\n{content}"
+                    if attachment_notes:
+                        prompt += "\n\n" + "\n".join(attachment_notes)
+
+                    # Inject plan mode instruction if a plan event was buffered
+                    if pending_plan_event:
+                        if pending_plan_event == "plan:enter":
+                            prompt += "\n\n[System: The user has activated planning mode. Use /plan to enter plan mode before responding.]"
+                        elif pending_plan_event == "plan:exit":
+                            prompt += "\n\n[System: The user has deactivated planning mode.]"
+                        pending_plan_event = None
+
+                    await client.query(prompt)
+                    async for message in client.receive_response():
+                        await handle_response_message(message, api)
+
+            # Client exited — log and loop back for fresh context
+            log.info("Agent context reset (%s), starting fresh client", reset_reason)
 
     except Exception as e:
         log.error("Agent error: %s", e)
