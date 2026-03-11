@@ -288,6 +288,16 @@ def make_post_tool_hook(api: ChatAPI):
             if diff_desc:
                 await api.send_tool_status("active", tool="Edit", description=diff_desc)
 
+        # Send tool output for Bash, Glob, and Grep
+        tool_response = input_data.get("tool_response", "")
+        if tool_name in ("Bash", "Glob", "Grep") and tool_response:
+            output = tool_response.strip()
+            if output:
+                desc = _describe_tool(tool_name, tool_input)
+                await api.send_tool_status(
+                    "active", tool=tool_name, description=f"output:{desc}\n{output}"
+                )
+
         await api.send_tool_status("done", tool=tool_name)
         return {}
 
