@@ -302,8 +302,16 @@ class DeviceManager:
         await self._store_event_locally(event)
 
         # Forward worker-relevant events via IPC
+        # Skip metadata-only user messages — the user-content relay provides the real content
         if self.ipc:
-            await self._forward_event_to_worker(event)
+            if (
+                event_type == "aichat:message"
+                and event.get("sender") == "user"
+                and not event.get("content")
+            ):
+                log.debug("Skipping metadata-only user message, waiting for user-content relay")
+            else:
+                await self._forward_event_to_worker(event)
 
     async def _handle_rekey_request(self, event: dict) -> None:
         """Handle a re-key request from a new browser session.
@@ -577,6 +585,8 @@ class DeviceManager:
             )
             if encrypted:
                 ct, nonce = encrypted
+                ws_msg["encrypted_payload"] = ct
+                ws_msg["nonce"] = nonce
                 ws_msg["content"] = ""  # Don't send plaintext when encrypted
 
             result = await self._ws_request(ws_msg)
