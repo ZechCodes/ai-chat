@@ -25,6 +25,7 @@ import httpx
 import websockets
 
 from aichat_api import AiChatAPI
+from aichat_db import LocalDB
 from aichat_device_auth import (
     DeviceConfig,
     generate_device_keypair,
@@ -68,7 +69,7 @@ class WorkerProcess:
 
 def parse_device_command(event: dict) -> dict | None:
     """Parse a notification event, returning command data if it's a device command."""
-    if event.get("type") != "aichat:device-command":
+    if event.get("event_type") != "aichat:device-command":
         return None
     command = event.get("command")
     if not command:
@@ -85,7 +86,7 @@ def _parse_worker_event(event: dict, channel_id: str) -> dict | None:
     if event.get("channel_id") and event.get("channel_id") != channel_id:
         return None
 
-    event_type = event.get("type")
+    event_type = event.get("event_type")
 
     # User messages
     if event_type == "aichat:message" and event.get("sender") == "user":
@@ -134,6 +135,9 @@ class DeviceManager:
         self.workers: dict[str, WorkerProcess] = {}
         self.last_event_ts: str | None = None
 
+        # Local database for messages and channels
+        self.local_db = LocalDB()
+
         # IPC server (initialized in start_ipc())
         self.ipc: IPCServer | None = None
         self.ipc_socket_path: str = f"/tmp/aichat-{device_id}.sock"
@@ -164,31 +168,11 @@ class DeviceManager:
                     backoff = 1  # reset on successful connect
                     log.info("WebSocket connected")
 
-                    # Initial sync after (re)connect
-                    await self.report_status()
-                    await self.sync_channels()
-
-                    # Read loop
-                    async for raw in ws:
-                        try:
-                            msg = json.loads(raw)
-                        except (json.JSONDecodeError, ValueError):
-                            continue
-
-                        msg_type = msg.get("type")
-
-                        if msg_type == "response":
-                            rid = msg.get("rid")
-                            future = self._ws_pending.pop(rid, None) if rid else None
-                            if future and not future.done():
-                                future.set_result(msg)
-                            continue
-
-                        if msg_type == "event":
-                            await self._handle_ws_event(msg)
-                            continue
-
-                        log.warning("Unknown WS message type: %s", msg_type)
+                    # Start the read loop first so responses can be dispatched,
+                    # then run initial sync. Both run concurrently.
+                    async with asyncio.TaskGroup() as tg:
+                        tg.create_task(self._ws_read_loop(ws))
+                        tg.create_task(self._initial_sync())
 
             except Exception as e:
                 log.warning("WebSocket error: %s, reconnecting in %ds", e, backoff)
@@ -200,6 +184,34 @@ class DeviceManager:
                 self._ws_pending.clear()
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
+
+    async def _ws_read_loop(self, ws) -> None:
+        """Read messages from WebSocket and dispatch responses/events."""
+        async for raw in ws:
+            try:
+                msg = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            msg_type = msg.get("type")
+
+            if msg_type == "response":
+                rid = msg.get("rid")
+                future = self._ws_pending.pop(rid, None) if rid else None
+                if future and not future.done():
+                    future.set_result(msg)
+                continue
+
+            if msg_type == "event":
+                await self._handle_ws_event(msg)
+                continue
+
+            log.warning("Unknown WS message type: %s", msg_type)
+
+    async def _initial_sync(self) -> None:
+        """Run initial sync after WebSocket connect."""
+        await self.report_status()
+        await self.sync_channels()
 
     async def _ws_request(self, msg: dict, timeout: float = 30.0) -> dict:
         """Send a request over WebSocket and await the correlated response."""
@@ -247,9 +259,46 @@ class DeviceManager:
         if "timestamp" in event:
             self.last_event_ts = event["timestamp"]
 
+        # Dual-write: store incoming messages locally
+        await self._store_event_locally(event)
+
         # Forward worker-relevant events via IPC
         if self.ipc:
             await self._forward_event_to_worker(event)
+
+    async def _store_event_locally(self, event: dict) -> None:
+        """Store incoming notification events in local SQLite."""
+        try:
+            event_type = event.get("event_type")
+
+            # User messages
+            if event_type == "aichat:message" and event.get("sender") == "user":
+                attachments = event.get("attachments")
+                await self.local_db.save_message(
+                    channel_id=event["channel_id"],
+                    sender="user",
+                    content=event.get("content", ""),
+                    message_id=event.get("message_id"),
+                    attachments=attachments if attachments else None,
+                )
+
+            # Event messages (plan mode etc)
+            elif event_type == "aichat:message" and event.get("sender") == "event":
+                await self.local_db.save_message(
+                    channel_id=event["channel_id"],
+                    sender="event",
+                    content=event.get("content", ""),
+                    message_id=event.get("message_id"),
+                )
+
+            # Mark-read from user side
+            elif event_type == "aichat:read":
+                message_ids = event.get("message_ids", [])
+                if message_ids:
+                    await self.local_db.mark_read_by_user(message_ids)
+
+        except Exception as e:
+            log.warning("Failed to store event locally: %s", e)
 
     # ------------------------------------------------------------------
     # IPC: worker request proxying
@@ -260,11 +309,22 @@ class DeviceManager:
         msg_type = msg.get("type")
 
         if msg_type == MSG_SEND_MESSAGE:
-            return await self._ws_request({
+            result = await self._ws_request({
                 "type": "send_message",
                 "channel_id": channel_id,
                 "content": msg["content"],
             })
+            # Dual-write: store plaintext locally
+            try:
+                await self.local_db.save_message(
+                    channel_id=channel_id,
+                    sender="claude",
+                    content=msg["content"],
+                    message_id=result.get("message_id"),
+                )
+            except Exception as e:
+                log.warning("Failed to save message to local DB: %s", e)
+            return result
 
         if msg_type == MSG_TOOL_STATUS:
             await self._ws_fire_and_forget({
@@ -274,14 +334,34 @@ class DeviceManager:
                 "tool": msg.get("tool", ""),
                 "description": msg.get("description", ""),
             })
+            # Dual-write: store tool status locally
+            try:
+                tool_content = json.dumps({
+                    "status": msg.get("status", ""),
+                    "tool": msg.get("tool", ""),
+                    "description": msg.get("description", ""),
+                })
+                await self.local_db.save_message(
+                    channel_id=channel_id,
+                    sender="tools",
+                    content=tool_content,
+                )
+            except Exception as e:
+                log.warning("Failed to save tool status to local DB: %s", e)
             return {}
 
         if msg_type == MSG_MARK_READ:
-            return await self._ws_request({
+            result = await self._ws_request({
                 "type": "mark_read",
                 "channel_id": channel_id,
                 "message_ids": msg.get("message_ids", []),
             })
+            # Dual-write: mark read locally
+            try:
+                await self.local_db.mark_read_by_claude(msg.get("message_ids", []))
+            except Exception as e:
+                log.warning("Failed to mark read in local DB: %s", e)
+            return result
 
         if msg_type == MSG_CREATE_INTERACTION:
             return await self._ws_request({
@@ -294,19 +374,43 @@ class DeviceManager:
             })
 
         if msg_type == MSG_SEND_EVENT:
-            return await self._ws_request({
+            result = await self._ws_request({
                 "type": "send_event",
                 "channel_id": channel_id,
                 "event_type": msg["event_type"],
             })
+            # Dual-write: store event locally
+            try:
+                await self.local_db.save_message(
+                    channel_id=channel_id,
+                    sender="event",
+                    content=msg["event_type"],
+                    message_id=result.get("message_id"),
+                )
+            except Exception as e:
+                log.warning("Failed to save event to local DB: %s", e)
+            return result
 
         if msg_type == MSG_REPORT_DIRECTORIES:
-            return await self._ws_request({
+            result = await self._ws_request({
                 "type": "report_directories",
                 "channel_id": channel_id,
                 "working_directory": msg["working_directory"],
                 "additional_directories": msg.get("additional_directories"),
             })
+            # Dual-write: update channel directories locally
+            try:
+                channel = await self.local_db.get_channel(channel_id)
+                if channel:
+                    await self.local_db.save_channel(
+                        channel_id=channel_id,
+                        name=channel["name"],
+                        working_directory=msg["working_directory"],
+                        additional_directories=msg.get("additional_directories"),
+                    )
+            except Exception as e:
+                log.warning("Failed to update directories in local DB: %s", e)
+            return result
 
         if msg_type == MSG_DOWNLOAD_ATTACHMENT:
             # Attachment downloads stay as HTTP (binary data not suited for WS JSON)
@@ -546,6 +650,18 @@ class DeviceManager:
             return
 
         server_channels = {ch["id"]: ch for ch in data.get("channels", [])}
+
+        # Dual-write: sync channel metadata to local DB
+        for ch_id, ch_info in server_channels.items():
+            try:
+                await self.local_db.save_channel(
+                    channel_id=ch_id,
+                    name=ch_info.get("name", ""),
+                    device_id=self.device_id,
+                    working_directory=ch_info.get("working_directory"),
+                )
+            except Exception as e:
+                log.warning("Failed to sync channel %s to local DB: %s", ch_id, e)
         server_channel_ids = set(server_channels.keys())
         local_channel_ids = set(self.workers.keys())
 
@@ -632,11 +748,12 @@ class DeviceManager:
     # ------------------------------------------------------------------
 
     async def shutdown(self) -> None:
-        """Gracefully stop all workers and IPC server."""
+        """Gracefully stop all workers, IPC server, and local database."""
         log.info("Shutting down, stopping %d workers", len(self.workers))
         for channel_id in list(self.workers.keys()):
             await self.stop_worker(channel_id)
         await self.stop_ipc()
+        await self.local_db.close()
 
 
 async def device_auth_flow(base_url: str) -> DeviceConfig:
@@ -700,7 +817,8 @@ async def run_manager() -> None:
         base_url=config.base_url,
     )
 
-    # Start IPC server before connecting WebSocket
+    # Open local database and start IPC server before connecting WebSocket
+    await manager.local_db.open()
     await manager.start_ipc()
 
     try:
