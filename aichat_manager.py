@@ -208,6 +208,7 @@ class DeviceManager:
                 continue
 
             if msg_type == "event":
+                log.info("WS event received: event_type=%s", msg.get("event_type"))
                 await self._handle_ws_event(msg)
                 continue
 
@@ -526,7 +527,7 @@ class DeviceManager:
                     channel_id=channel_id,
                     sender="claude",
                     content=content,
-                    message_id=result.get("message_id"),
+                    message_id=result.get("id") or result.get("message_id"),
                 )
             except Exception as e:
                 log.warning("Failed to save message to local DB: %s", e)
@@ -619,7 +620,7 @@ class DeviceManager:
                     channel_id=channel_id,
                     sender="event",
                     content=msg["event_type"],
-                    message_id=result.get("message_id"),
+                    message_id=result.get("id") or result.get("message_id"),
                 )
             except Exception as e:
                 log.warning("Failed to save event to local DB: %s", e)
