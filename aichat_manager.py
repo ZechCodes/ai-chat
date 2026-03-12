@@ -216,7 +216,24 @@ class DeviceManager:
     async def _initial_sync(self) -> None:
         """Run initial sync after WebSocket connect."""
         await self.report_status()
+        await self._push_x25519_public()
         await self.sync_channels()
+
+    async def _push_x25519_public(self) -> None:
+        """Push device X25519 public key to server if available."""
+        if not self.x25519_private_b64:
+            return
+        config = load_device_config()
+        if not config or not config.x25519_public_b64:
+            return
+        try:
+            await self._ws_request({
+                "type": "update_device_x25519",
+                "x25519_public": config.x25519_public_b64,
+            })
+            log.info("Pushed X25519 public key to server")
+        except Exception as e:
+            log.warning("Failed to push X25519 public key: %s", e)
 
     async def _ws_request(self, msg: dict, timeout: float = 30.0) -> dict:
         """Send a request over WebSocket and await the correlated response."""
@@ -301,6 +318,13 @@ class DeviceManager:
             # Compute new shared secret with the browser's ephemeral key
             new_master = derive_key(self.x25519_private_b64, browser_x25519_public)
 
+            # Update in-memory master key and persist to device.json
+            self.device_master_key_b64 = new_master
+            config = load_device_config()
+            if config:
+                config.device_master_key_b64 = new_master
+                save_device_config(config)
+
             # Re-encrypt all channel keys with the new master key
             encrypted_keys = {}
             channels = await self.local_db.list_channels()
@@ -312,6 +336,8 @@ class DeviceManager:
                         "encrypted_key": ct,
                         "nonce": nonce,
                     }
+                    # Also upload to server so chat page can serve them
+                    await self._upload_encrypted_channel_key(ch["id"], ch_key)
 
             # Send back via WebSocket
             await self._ws_fire_and_forget({
@@ -1060,12 +1086,25 @@ async def device_auth_flow(base_url: str) -> DeviceConfig:
 
 async def run_manager() -> None:
     """Main manager entry point."""
+    from aichat_crypto import generate_x25519_keypair
+
     base_url = os.environ.get("AICHAT_URL", "https://aichat.zech.sh")
 
     # Load or create device config
     config = load_device_config()
     if not config:
         config = await device_auth_flow(base_url)
+
+    # Migrate existing device: generate X25519 keypair if missing
+    if not config.x25519_private_b64 or not config.x25519_public_b64:
+        log.info("Generating X25519 keypair for existing device (E2E migration)...")
+        x25519_kp = generate_x25519_keypair()
+        config.x25519_private_b64 = x25519_kp["private_key_b64"]
+        config.x25519_public_b64 = x25519_kp["public_key_b64"]
+        # Clear any stale master key — it'll be derived on first rekey
+        config.device_master_key_b64 = ""
+        save_device_config(config)
+        log.info("X25519 keypair saved — E2E will activate on next browser key exchange")
 
     log.info("Device: %s (%s)", config.device_name, config.device_id)
 
