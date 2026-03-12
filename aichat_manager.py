@@ -25,7 +25,7 @@ import httpx
 import websockets
 
 from aichat_api import AiChatAPI
-from aichat_crypto import encrypt_channel_key, generate_channel_key
+from aichat_crypto import encrypt, encrypt_channel_key, decrypt, generate_channel_key
 from aichat_db import LocalDB
 from aichat_device_auth import (
     DeviceConfig,
@@ -260,6 +260,17 @@ class DeviceManager:
             await self.handle_command(cmd)
             return
 
+        # Re-key requests from new browser sessions
+        event_type = event.get("event_type")
+        if event_type == "aichat:rekey-request":
+            await self._handle_rekey_request(event)
+            return
+
+        # History requests from browser
+        if event_type == "aichat:history-request":
+            await self._handle_history_request(event)
+            return
+
         # Track timestamp for potential replay
         if "timestamp" in event:
             self.last_event_ts = event["timestamp"]
@@ -271,18 +282,141 @@ class DeviceManager:
         if self.ipc:
             await self._forward_event_to_worker(event)
 
+    async def _handle_rekey_request(self, event: dict) -> None:
+        """Handle a re-key request from a new browser session.
+
+        Browser sends its X25519 public key. We compute a new shared secret,
+        re-encrypt all channel keys, and send them back.
+        """
+        from aichat_crypto import derive_device_master_key_b64 as derive_key
+
+        browser_x25519_public = event.get("browser_x25519_public", "")
+        request_id = event.get("request_id", "")
+
+        if not browser_x25519_public or not self.x25519_private_b64:
+            log.warning("Re-key request missing browser key or device X25519 key")
+            return
+
+        try:
+            # Compute new shared secret with the browser's ephemeral key
+            new_master = derive_key(self.x25519_private_b64, browser_x25519_public)
+
+            # Re-encrypt all channel keys with the new master key
+            encrypted_keys = {}
+            channels = await self.local_db.list_channels()
+            for ch in channels:
+                ch_key = ch.get("channel_key_b64")
+                if ch_key:
+                    ct, nonce = encrypt_channel_key(new_master, ch_key)
+                    encrypted_keys[ch["id"]] = {
+                        "encrypted_key": ct,
+                        "nonce": nonce,
+                    }
+
+            # Send back via WebSocket
+            await self._ws_fire_and_forget({
+                "type": "rekey_response",
+                "request_id": request_id,
+                "encrypted_keys": encrypted_keys,
+            })
+            log.info("Sent re-key response with %d channel keys", len(encrypted_keys))
+
+        except Exception as e:
+            log.warning("Re-key failed: %s", e)
+
+    async def _handle_history_request(self, event: dict) -> None:
+        """Handle a history request from the browser, proxied via server.
+
+        Query local SQLite and send encrypted messages back.
+        """
+        channel_id = event.get("channel_id", "")
+        request_id = event.get("request_id", "")
+        before_id = event.get("before")
+        limit = min(event.get("limit", 100), 200)
+
+        if not channel_id or not request_id:
+            return
+
+        try:
+            messages = await self.local_db.get_messages(
+                channel_id, limit=limit + 1, before_id=before_id
+            )
+            has_more = len(messages) > limit
+            messages = messages[:limit]
+
+            # Encrypt each message for the browser
+            channel_key = await self._get_channel_key(channel_id)
+            encrypted_messages = []
+            for msg in messages:
+                msg_data = {
+                    "id": msg["id"],
+                    "sender": msg["sender"],
+                    "created_at": msg["created_at"],
+                    "read_by_user_at": msg.get("read_by_user_at"),
+                    "read_by_claude_at": msg.get("read_by_claude_at"),
+                }
+                if channel_key:
+                    payload = json.dumps({
+                        "content": msg["content"],
+                        "attachments": json.loads(msg["attachments"]) if msg.get("attachments") else None,
+                    })
+                    ct, nonce = encrypt(channel_key, payload)
+                    msg_data["encrypted_payload"] = ct
+                    msg_data["nonce"] = nonce
+                else:
+                    msg_data["content"] = msg["content"]
+                    msg_data["attachments"] = json.loads(msg["attachments"]) if msg.get("attachments") else None
+
+                encrypted_messages.append(msg_data)
+
+            await self._ws_fire_and_forget({
+                "type": "history_response",
+                "request_id": request_id,
+                "channel_id": channel_id,
+                "messages": encrypted_messages,
+                "has_more": has_more,
+            })
+            log.info("Sent %d history messages for channel %s", len(encrypted_messages), channel_id)
+
+        except Exception as e:
+            log.warning("History request failed for channel %s: %s", channel_id, e)
+
     async def _store_event_locally(self, event: dict) -> None:
-        """Store incoming notification events in local SQLite."""
+        """Store incoming notification events in local SQLite.
+
+        Handles both plaintext and E2E encrypted messages. If encrypted,
+        decrypts before storing locally and patches the event dict with
+        plaintext for forwarding to workers.
+        """
         try:
             event_type = event.get("event_type")
 
-            # User messages
+            # User messages (may be encrypted from browser)
             if event_type == "aichat:message" and event.get("sender") == "user":
+                content = event.get("content", "")
                 attachments = event.get("attachments")
+
+                # Decrypt if encrypted
+                if event.get("encrypted_payload") and event.get("nonce"):
+                    channel_id = event.get("channel_id", "")
+                    plaintext = await self._decrypt_content(
+                        channel_id, event["encrypted_payload"], event["nonce"]
+                    )
+                    if plaintext:
+                        try:
+                            payload = json.loads(plaintext)
+                            content = payload.get("content", content)
+                            attachments = payload.get("attachments", attachments)
+                        except (json.JSONDecodeError, TypeError):
+                            content = plaintext
+                        # Patch event for worker forwarding
+                        event["content"] = content
+                        event["attachments"] = attachments
+
                 await self.local_db.save_message(
                     channel_id=event["channel_id"],
                     sender="user",
-                    content=event.get("content", ""),
+                    content=content,
                     message_id=event.get("message_id"),
                     attachments=attachments if attachments else None,
                 )
@@ -306,6 +440,35 @@ class DeviceManager:
             log.warning("Failed to store event locally: %s", e)
 
     # ------------------------------------------------------------------
+    # E2E encryption helpers
+    # ------------------------------------------------------------------
+
+    async def _get_channel_key(self, channel_id: str) -> str | None:
+        """Get the plaintext channel encryption key from local DB."""
+        channel = await self.local_db.get_channel(channel_id)
+        if channel and channel.get("channel_key_b64"):
+            return channel["channel_key_b64"]
+        return None
+
+    async def _encrypt_content(self, channel_id: str, content: str) -> tuple[str, str] | None:
+        """Encrypt content with the channel key. Returns (ciphertext_b64, nonce_b64) or None."""
+        key = await self._get_channel_key(channel_id)
+        if not key:
+            return None
+        return encrypt(key, content)
+
+    async def _decrypt_content(self, channel_id: str, ciphertext_b64: str, nonce_b64: str) -> str | None:
+        """Decrypt content with the channel key. Returns plaintext or None."""
+        key = await self._get_channel_key(channel_id)
+        if not key:
+            return None
+        try:
+            return decrypt(key, ciphertext_b64, nonce_b64)
+        except Exception as e:
+            log.warning("Failed to decrypt content for channel %s: %s", channel_id, e)
+            return None
+
+    # ------------------------------------------------------------------
     # IPC: worker request proxying
     # ------------------------------------------------------------------
 
@@ -314,17 +477,29 @@ class DeviceManager:
         msg_type = msg.get("type")
 
         if msg_type == MSG_SEND_MESSAGE:
-            result = await self._ws_request({
+            content = msg["content"]
+            ws_msg = {
                 "type": "send_message",
                 "channel_id": channel_id,
-                "content": msg["content"],
-            })
-            # Dual-write: store plaintext locally
+                "content": content,  # Plaintext fallback
+            }
+
+            # E2E: encrypt content if channel key available
+            encrypted = await self._encrypt_content(channel_id, content)
+            if encrypted:
+                ct, nonce = encrypted
+                ws_msg["encrypted_payload"] = ct
+                ws_msg["nonce"] = nonce
+                ws_msg["content"] = ""  # Don't send plaintext when encrypted
+
+            result = await self._ws_request(ws_msg)
+
+            # Store plaintext locally (always)
             try:
                 await self.local_db.save_message(
                     channel_id=channel_id,
                     sender="claude",
-                    content=msg["content"],
+                    content=content,
                     message_id=result.get("message_id"),
                 )
             except Exception as e:
@@ -332,19 +507,32 @@ class DeviceManager:
             return result
 
         if msg_type == MSG_TOOL_STATUS:
-            await self._ws_fire_and_forget({
+            description = msg.get("description", "")
+            ws_msg = {
                 "type": "tool_status",
                 "channel_id": channel_id,
                 "status": msg.get("status", ""),
                 "tool": msg.get("tool", ""),
-                "description": msg.get("description", ""),
-            })
-            # Dual-write: store tool status locally
+                "description": description,  # Plaintext fallback
+            }
+
+            # E2E: encrypt description if channel key available
+            if description:
+                encrypted = await self._encrypt_content(channel_id, description)
+                if encrypted:
+                    ct, nonce = encrypted
+                    ws_msg["encrypted_description"] = ct
+                    ws_msg["description_nonce"] = nonce
+                    ws_msg["description"] = ""  # Don't send plaintext
+
+            await self._ws_fire_and_forget(ws_msg)
+
+            # Store plaintext locally
             try:
                 tool_content = json.dumps({
                     "status": msg.get("status", ""),
                     "tool": msg.get("tool", ""),
-                    "description": msg.get("description", ""),
+                    "description": description,
                 })
                 await self.local_db.save_message(
                     channel_id=channel_id,
@@ -369,14 +557,29 @@ class DeviceManager:
             return result
 
         if msg_type == MSG_CREATE_INTERACTION:
-            return await self._ws_request({
+            content = msg["content"]
+            ws_msg = {
                 "type": "create_interaction",
                 "channel_id": channel_id,
                 "interaction_type": msg["interaction_type"],
-                "content": msg["content"],
+                "content": content,  # Plaintext fallback
                 "options": msg.get("options"),
                 "multi_select": msg.get("multi_select", False),
-            })
+            }
+
+            # E2E: encrypt interaction content
+            encrypted = await self._encrypt_content(channel_id, json.dumps({
+                "content": content,
+                "options": msg.get("options"),
+            }))
+            if encrypted:
+                ct, nonce = encrypted
+                ws_msg["encrypted_payload"] = ct
+                ws_msg["nonce"] = nonce
+                ws_msg["content"] = ""
+                ws_msg["options"] = None
+
+            return await self._ws_request(ws_msg)
 
         if msg_type == MSG_SEND_EVENT:
             result = await self._ws_request({
