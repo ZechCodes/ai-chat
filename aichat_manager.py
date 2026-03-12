@@ -289,6 +289,11 @@ class DeviceManager:
             await self._handle_history_request(event)
             return
 
+        # Direct user content relay (encrypted content pushed from server, bypasses notifications)
+        if event_type == "aichat:user-content":
+            await self._handle_user_content_relay(event)
+            return
+
         # Track timestamp for potential replay
         if "timestamp" in event:
             self.last_event_ts = event["timestamp"]
@@ -408,6 +413,58 @@ class DeviceManager:
         except Exception as e:
             log.warning("History request failed for channel %s: %s", channel_id, e)
 
+    async def _handle_user_content_relay(self, event: dict) -> None:
+        """Handle encrypted user message content pushed directly via WebSocket.
+
+        The server pushes encrypted content here (bypassing notifications) so
+        ciphertext is never persisted. We decrypt, store plaintext locally,
+        and forward to the worker.
+        """
+        channel_id = event.get("channel_id", "")
+        encrypted_payload = event.get("encrypted_payload", "")
+        nonce = event.get("nonce", "")
+        message_id = event.get("message_id", "")
+
+        if not channel_id or not encrypted_payload or not nonce:
+            return
+
+        content = ""
+        attachments = None
+        channel_key = await self._get_channel_key(channel_id)
+        if channel_key:
+            try:
+                from aichat_crypto import decrypt
+                plain = decrypt(channel_key, encrypted_payload, nonce)
+                if plain:
+                    payload = json.loads(plain)
+                    content = payload.get("content", "")
+                    attachments = payload.get("attachments")
+            except Exception as e:
+                log.warning("Failed to decrypt user content relay: %s", e)
+
+        # Store plaintext locally
+        try:
+            await self.local_db.save_message(
+                channel_id=channel_id,
+                sender="user",
+                content=content,
+                message_id=message_id,
+                attachments=json.dumps(attachments) if attachments else None,
+            )
+        except Exception as e:
+            log.warning("Failed to save user content to local DB: %s", e)
+
+        # Forward to worker as a plaintext event
+        if self.ipc:
+            await self._forward_event_to_worker({
+                "event_type": "aichat:message",
+                "sender": "user",
+                "content": content,
+                "message_id": message_id,
+                "channel_id": channel_id,
+                "attachments": attachments,
+            })
+
     async def _store_event_locally(self, event: dict) -> None:
         """Store incoming notification events in local SQLite.
 
@@ -512,25 +569,41 @@ class DeviceManager:
             }
 
             # E2E: encrypt content if channel key available
-            encrypted = await self._encrypt_content(channel_id, content)
+            # Wrap in {content, attachments} to match browser encryption format
+            attachments = msg.get("attachments")
+            encrypted = await self._encrypt_content(
+                channel_id,
+                json.dumps({"content": content, "attachments": attachments or []}),
+            )
             if encrypted:
                 ct, nonce = encrypted
-                ws_msg["encrypted_payload"] = ct
-                ws_msg["nonce"] = nonce
                 ws_msg["content"] = ""  # Don't send plaintext when encrypted
 
             result = await self._ws_request(ws_msg)
 
             # Store plaintext locally (always)
+            message_id = result.get("id") or result.get("message_id")
             try:
                 await self.local_db.save_message(
                     channel_id=channel_id,
                     sender="claude",
                     content=content,
-                    message_id=result.get("id") or result.get("message_id"),
+                    message_id=message_id,
                 )
             except Exception as e:
                 log.warning("Failed to save message to local DB: %s", e)
+
+            # E2E: send encrypted content via ephemeral relay (separate from notification)
+            if encrypted:
+                await self._ws_fire_and_forget({
+                    "type": "relay_content",
+                    "channel_id": channel_id,
+                    "content_type": "message",
+                    "message_id": message_id,
+                    "encrypted_payload": ct,
+                    "nonce": nonce,
+                })
+
             return result
 
         if msg_type == MSG_TOOL_STATUS:
@@ -543,16 +616,25 @@ class DeviceManager:
                 "description": description,  # Plaintext fallback
             }
 
-            # E2E: encrypt description if channel key available
+            # E2E: encrypt description — send via ephemeral relay, not in notification
+            encrypted = None
             if description:
                 encrypted = await self._encrypt_content(channel_id, description)
                 if encrypted:
-                    ct, nonce = encrypted
-                    ws_msg["encrypted_description"] = ct
-                    ws_msg["description_nonce"] = nonce
                     ws_msg["description"] = ""  # Don't send plaintext
 
             await self._ws_fire_and_forget(ws_msg)
+
+            # Send encrypted content via ephemeral relay
+            if encrypted:
+                ct, nonce = encrypted
+                await self._ws_fire_and_forget({
+                    "type": "relay_content",
+                    "channel_id": channel_id,
+                    "content_type": "tool",
+                    "encrypted_payload": ct,
+                    "nonce": nonce,
+                })
 
             # Store plaintext locally
             try:
@@ -594,19 +676,30 @@ class DeviceManager:
                 "multi_select": msg.get("multi_select", False),
             }
 
-            # E2E: encrypt interaction content
+            # E2E: encrypt interaction content — send via ephemeral relay
             encrypted = await self._encrypt_content(channel_id, json.dumps({
                 "content": content,
                 "options": msg.get("options"),
             }))
             if encrypted:
                 ct, nonce = encrypted
-                ws_msg["encrypted_payload"] = ct
-                ws_msg["nonce"] = nonce
                 ws_msg["content"] = ""
                 ws_msg["options"] = None
 
-            return await self._ws_request(ws_msg)
+            result = await self._ws_request(ws_msg)
+
+            # Send encrypted content via ephemeral relay
+            if encrypted:
+                await self._ws_fire_and_forget({
+                    "type": "relay_content",
+                    "channel_id": channel_id,
+                    "content_type": "interaction",
+                    "interaction_id": result.get("interaction_id", ""),
+                    "encrypted_payload": ct,
+                    "nonce": nonce,
+                })
+
+            return result
 
         if msg_type == MSG_SEND_EVENT:
             result = await self._ws_request({
