@@ -25,6 +25,7 @@ import httpx
 import websockets
 
 from aichat_api import AiChatAPI
+from aichat_crypto import encrypt_channel_key, generate_channel_key
 from aichat_db import LocalDB
 from aichat_device_auth import (
     DeviceConfig,
@@ -128,10 +129,14 @@ def _parse_worker_event(event: dict, channel_id: str) -> dict | None:
 class DeviceManager:
     """Manages worker processes on this device."""
 
-    def __init__(self, device_id: str, private_key_b64: str, base_url: str):
+    def __init__(self, device_id: str, private_key_b64: str, base_url: str,
+                 device_master_key_b64: str = "",
+                 x25519_private_b64: str = ""):
         self.device_id = device_id
         self.private_key_b64 = private_key_b64
         self.base_url = base_url
+        self.device_master_key_b64 = device_master_key_b64
+        self.x25519_private_b64 = x25519_private_b64
         self.workers: dict[str, WorkerProcess] = {}
         self.last_event_ts: str | None = None
 
@@ -651,14 +656,27 @@ class DeviceManager:
 
         server_channels = {ch["id"]: ch for ch in data.get("channels", [])}
 
-        # Dual-write: sync channel metadata to local DB
+        # Dual-write: sync channel metadata to local DB and generate encryption keys
         for ch_id, ch_info in server_channels.items():
             try:
+                existing = await self.local_db.get_channel(ch_id)
+                channel_key_b64 = existing["channel_key_b64"] if existing and existing.get("channel_key_b64") else None
+
+                # Generate channel key if missing
+                if not channel_key_b64:
+                    channel_key_b64 = generate_channel_key()
+                    log.info("Generated encryption key for channel %s", ch_id)
+
+                    # Upload encrypted channel key to server if we have a device master key
+                    if self.device_master_key_b64:
+                        await self._upload_encrypted_channel_key(ch_id, channel_key_b64)
+
                 await self.local_db.save_channel(
                     channel_id=ch_id,
                     name=ch_info.get("name", ""),
                     device_id=self.device_id,
                     working_directory=ch_info.get("working_directory"),
+                    channel_key_b64=channel_key_b64,
                 )
             except Exception as e:
                 log.warning("Failed to sync channel %s to local DB: %s", ch_id, e)
@@ -696,6 +714,24 @@ class DeviceManager:
             working_directory = ch_info.get("working_directory", "")
             log.info("Channel %s assigned to device, starting worker (cwd=%s)", channel_id, working_directory or "<default>")
             await self.start_worker(channel_id, working_directory=working_directory)
+
+    async def _upload_encrypted_channel_key(
+        self, channel_id: str, channel_key_b64: str
+    ) -> None:
+        """Encrypt a channel key with the device master key and upload to server."""
+        try:
+            enc_key, nonce = encrypt_channel_key(
+                self.device_master_key_b64, channel_key_b64
+            )
+            await self._ws_request({
+                "type": "register_channel_key",
+                "channel_id": channel_id,
+                "encrypted_channel_key": enc_key,
+                "key_nonce": nonce,
+            })
+            log.info("Uploaded encrypted key for channel %s", channel_id)
+        except Exception as e:
+            log.warning("Failed to upload channel key for %s: %s", channel_id, e)
 
     async def report_status(self) -> None:
         """Report device status to the server via WebSocket."""
@@ -834,6 +870,8 @@ async def run_manager() -> None:
         device_id=config.device_id,
         private_key_b64=config.private_key_b64,
         base_url=config.base_url,
+        device_master_key_b64=config.device_master_key_b64,
+        x25519_private_b64=config.x25519_private_b64,
     )
 
     # Open local database and start IPC server before connecting WebSocket
