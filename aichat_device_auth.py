@@ -1,7 +1,7 @@
 """Device-level auth for AI.CHAT manager.
 
-Handles Ed25519 keypair generation, device registration, approval polling,
-and persistent device config storage.
+Handles Ed25519 keypair generation, X25519 key exchange for E2E encryption,
+device registration, approval polling, and persistent device config storage.
 """
 
 from __future__ import annotations
@@ -16,6 +16,8 @@ from pathlib import Path
 import httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from aichat_crypto import derive_device_master_key_b64, generate_x25519_keypair
+
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "aichat" / "device.json"
 
 
@@ -29,6 +31,11 @@ class DeviceConfig:
     public_key_b64: str
     base_url: str
     workers: dict[str, dict] = field(default_factory=dict)
+    # X25519 private key for E2E key exchange (persisted for re-keying)
+    x25519_private_b64: str = ""
+    x25519_public_b64: str = ""
+    # Device master key derived from ECDH (encrypts channel keys)
+    device_master_key_b64: str = ""
 
 
 def generate_device_keypair() -> dict:
@@ -60,6 +67,9 @@ def load_device_config(path: Path = DEFAULT_CONFIG_PATH) -> DeviceConfig | None:
     try:
         data = json.loads(path.read_text())
         data.setdefault("workers", {})
+        data.setdefault("x25519_private_b64", "")
+        data.setdefault("x25519_public_b64", "")
+        data.setdefault("device_master_key_b64", "")
         return DeviceConfig(**data)
     except Exception:
         return None
@@ -69,16 +79,20 @@ async def register_device(
     base_url: str,
     public_key_b64: str,
     device_name: str,
+    x25519_public_b64: str = "",
 ) -> dict:
     """Register a new device with the server.
 
     POST /api/devices/register
     Returns {"device_code": "...", "auth_url": "..."}.
     """
+    payload = {"public_key": public_key_b64, "name": device_name}
+    if x25519_public_b64:
+        payload["x25519_public"] = x25519_public_b64
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{base_url}/api/devices/register",
-            json={"public_key": public_key_b64, "name": device_name},
+            json=payload,
         )
         resp.raise_for_status()
         return resp.json()

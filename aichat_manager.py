@@ -757,15 +757,19 @@ class DeviceManager:
 
 
 async def device_auth_flow(base_url: str) -> DeviceConfig:
-    """Run the interactive device auth flow."""
+    """Run the interactive device auth flow with X25519 key exchange."""
+    from aichat_crypto import derive_device_master_key_b64, generate_x25519_keypair
+
     device_name = platform.node() or "Unknown Device"
     keypair = generate_device_keypair()
+    x25519_kp = generate_x25519_keypair()
 
     log.info("Registering device '%s'...", device_name)
     result = await register_device(
         base_url=base_url,
         public_key_b64=keypair["public_key_b64"],
         device_name=device_name,
+        x25519_public_b64=x25519_kp["public_key_b64"],
     )
 
     auth_url = result["auth_url"]
@@ -785,12 +789,27 @@ async def device_auth_flow(base_url: str) -> DeviceConfig:
         status = await poll_for_approval(base_url, device_code)
         if status["status"] == "approved":
             log.info("Device approved!")
+
+            # Derive device master key from ECDH if browser provided its X25519 public key
+            device_master_key_b64 = ""
+            browser_x25519_public = status.get("browser_x25519_public", "")
+            if browser_x25519_public:
+                device_master_key_b64 = derive_device_master_key_b64(
+                    x25519_kp["private_key_b64"], browser_x25519_public
+                )
+                log.info("E2E key exchange completed — device master key derived")
+            else:
+                log.warning("Browser did not provide X25519 public key — E2E encryption unavailable")
+
             config = DeviceConfig(
                 device_id=status["device_id"],
                 device_name=device_name,
                 private_key_b64=keypair["private_key_b64"],
                 public_key_b64=keypair["public_key_b64"],
                 base_url=base_url,
+                x25519_private_b64=x25519_kp["private_key_b64"],
+                x25519_public_b64=x25519_kp["public_key_b64"],
+                device_master_key_b64=device_master_key_b64,
             )
             save_device_config(config)
             return config
