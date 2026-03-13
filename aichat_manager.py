@@ -336,11 +336,9 @@ class DeviceManager:
         """Handle a re-key request from a browser session.
 
         Browser sends its X25519 public key. We derive a transport key via ECDH,
-        then either establish or deliver the canonical encryption key.
-
-        - First rekey (no encryption key yet): transport key becomes the encryption key.
-        - Subsequent rekeys: wrap the existing encryption key with the transport key
-          so the new browser can decrypt messages.
+        then wrap the canonical encryption key with it for delivery. The encryption
+        key is always a random key generated on first manager start — ECDH is purely
+        a transport mechanism.
         """
         browser_x25519_public = event.get("browser_x25519_public", "")
         request_id = event.get("request_id", "")
@@ -349,31 +347,23 @@ class DeviceManager:
             log.warning("Re-key request missing browser key or device X25519 key")
             return
 
+        if not self.encryption_key_b64:
+            log.warning("Re-key request but no encryption key available")
+            return
+
         try:
-            # Derive a transport key for this browser via ECDH
             transport_key = self.key_exchange.complete_exchange(browser_x25519_public)
 
+            # Always wrap the encryption key with this browser's transport key
+            ct, nonce = crypto_encrypt(transport_key, self.encryption_key_b64)
             response = {
                 "type": "rekey_response",
                 "request_id": request_id,
+                "encrypted_key": ct,
+                "nonce": nonce,
             }
-
-            if self.encryption_key_b64:
-                # Wrap existing encryption key with the transport key for this browser
-                ct, nonce = crypto_encrypt(transport_key, self.encryption_key_b64)
-                response["encrypted_key"] = ct
-                response["nonce"] = nonce
-                log.info("Re-key complete — delivered existing encryption key to browser")
-            else:
-                # First exchange: transport key becomes the canonical encryption key
-                self.encryption_key_b64 = transport_key
-                config = load_device_config()
-                if config:
-                    config.encryption_key_b64 = transport_key
-                    save_device_config(config)
-                log.info("Re-key complete — established new encryption key")
-
             await self._ws_fire_and_forget(response)
+            log.info("Re-key complete — delivered encryption key to browser")
 
         except Exception as e:
             log.warning("Re-key failed: %s", e)
@@ -1177,7 +1167,7 @@ class DeviceManager:
 
 async def device_auth_flow(base_url: str) -> DeviceConfig:
     """Run the interactive device auth flow with X25519 key exchange."""
-    from aichat_crypto import KeyExchange, generate_x25519_keypair
+    from aichat_crypto import generate_x25519_keypair
 
     device_name = platform.node() or "Unknown Device"
     keypair = generate_device_keypair()
@@ -1209,16 +1199,7 @@ async def device_auth_flow(base_url: str) -> DeviceConfig:
         if status["status"] == "approved":
             log.info("Device approved!")
 
-            # Complete key exchange if browser provided its X25519 public key
-            encryption_key_b64 = ""
-            browser_x25519_public = status.get("browser_x25519_public", "")
-            if browser_x25519_public:
-                kx = KeyExchange(x25519_kp["private_key_b64"], x25519_kp["public_key_b64"])
-                encryption_key_b64 = kx.complete_exchange(browser_x25519_public)
-                log.info("E2E key exchange completed")
-            else:
-                log.warning("Browser did not provide X25519 public key — E2E encryption unavailable")
-
+            # Encryption key will be generated randomly on first manager start
             config = DeviceConfig(
                 device_id=status["device_id"],
                 device_name=device_name,
@@ -1227,7 +1208,7 @@ async def device_auth_flow(base_url: str) -> DeviceConfig:
                 base_url=base_url,
                 x25519_private_b64=x25519_kp["private_key_b64"],
                 x25519_public_b64=x25519_kp["public_key_b64"],
-                encryption_key_b64=encryption_key_b64,
+                encryption_key_b64="",
             )
             save_device_config(config)
             return config
@@ -1261,6 +1242,13 @@ async def run_manager(
         config.encryption_key_b64 = ""
         save_device_config(config)
         log.info("X25519 keypair saved — E2E will activate on next browser key exchange")
+
+    # Generate a random encryption key if none exists yet
+    if not config.encryption_key_b64:
+        import base64 as _b64
+        config.encryption_key_b64 = _b64.b64encode(os.urandom(32)).decode()
+        save_device_config(config)
+        log.info("Generated new random encryption key")
 
     # Build KeyExchange for ECDH transport during rekey
     key_exchange: KeyExchange | None = None
