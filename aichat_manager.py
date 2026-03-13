@@ -25,7 +25,7 @@ from dataclasses import dataclass
 import websockets
 
 from aichat_api import AiChatAPI
-from aichat_crypto import KeyExchange
+from aichat_crypto import KeyExchange, encrypt as crypto_encrypt, decrypt as crypto_decrypt
 from aichat_db import LocalDB
 from aichat_device_auth import (
     DeviceConfig,
@@ -152,11 +152,13 @@ class DeviceManager:
     """Manages worker processes on this device."""
 
     def __init__(self, device_id: str, private_key_b64: str, base_url: str,
-                 key_exchange: KeyExchange | None = None):
+                 key_exchange: KeyExchange | None = None,
+                 encryption_key_b64: str = ""):
         self.device_id = device_id
         self.private_key_b64 = private_key_b64
         self.base_url = base_url
-        self.key_exchange = key_exchange
+        self.key_exchange = key_exchange  # Only used for ECDH transport in rekey
+        self.encryption_key_b64 = encryption_key_b64  # Canonical key for all message encryption
         self.workers: dict[str, WorkerProcess] = {}
         self.last_event_ts: str | None = None
 
@@ -331,10 +333,14 @@ class DeviceManager:
                 await self._forward_event_to_worker(event)
 
     async def _handle_rekey_request(self, event: dict) -> None:
-        """Handle a re-key request from a new browser session.
+        """Handle a re-key request from a browser session.
 
-        Browser sends its X25519 public key. We complete the ECDH exchange,
-        persist the new key, and ack.
+        Browser sends its X25519 public key. We derive a transport key via ECDH,
+        then either establish or deliver the canonical encryption key.
+
+        - First rekey (no encryption key yet): transport key becomes the encryption key.
+        - Subsequent rekeys: wrap the existing encryption key with the transport key
+          so the new browser can decrypt messages.
         """
         browser_x25519_public = event.get("browser_x25519_public", "")
         request_id = event.get("request_id", "")
@@ -344,20 +350,30 @@ class DeviceManager:
             return
 
         try:
-            new_key = self.key_exchange.complete_exchange(browser_x25519_public)
+            # Derive a transport key for this browser via ECDH
+            transport_key = self.key_exchange.complete_exchange(browser_x25519_public)
 
-            # Persist to device.json
-            config = load_device_config()
-            if config:
-                config.encryption_key_b64 = new_key
-                save_device_config(config)
-
-            # Ack the rekey
-            await self._ws_fire_and_forget({
+            response = {
                 "type": "rekey_response",
                 "request_id": request_id,
-            })
-            log.info("Re-key complete")
+            }
+
+            if self.encryption_key_b64:
+                # Wrap existing encryption key with the transport key for this browser
+                ct, nonce = crypto_encrypt(transport_key, self.encryption_key_b64)
+                response["encrypted_key"] = ct
+                response["nonce"] = nonce
+                log.info("Re-key complete — delivered existing encryption key to browser")
+            else:
+                # First exchange: transport key becomes the canonical encryption key
+                self.encryption_key_b64 = transport_key
+                config = load_device_config()
+                if config:
+                    config.encryption_key_b64 = transport_key
+                    save_device_config(config)
+                log.info("Re-key complete — established new encryption key")
+
+            await self._ws_fire_and_forget(response)
 
         except Exception as e:
             log.warning("Re-key failed: %s", e)
@@ -396,9 +412,8 @@ class DeviceManager:
                     "content": msg["content"],
                     "attachments": json.loads(msg["attachments"]) if msg.get("attachments") else None,
                 })
-                encrypted = self.key_exchange.encrypt(payload) if self.key_exchange else None
-                if encrypted:
-                    ct, nonce = encrypted
+                if self.encryption_key_b64:
+                    ct, nonce = crypto_encrypt(self.encryption_key_b64, payload)
                     msg_data["encrypted_payload"] = ct
                     msg_data["nonce"] = nonce
                 else:
@@ -436,9 +451,9 @@ class DeviceManager:
 
         content = ""
         attachments = None
-        if self.key_exchange:
+        if self.encryption_key_b64:
             try:
-                plain = self.key_exchange.decrypt(encrypted_payload, nonce)
+                plain = crypto_decrypt(self.encryption_key_b64, encrypted_payload, nonce)
                 if plain:
                     payload = json.loads(plain)
                     content = payload.get("content", "")
@@ -485,10 +500,13 @@ class DeviceManager:
                 attachments = event.get("attachments")
 
                 # Decrypt if encrypted
-                if event.get("encrypted_payload") and event.get("nonce") and self.key_exchange:
-                    plaintext = self.key_exchange.decrypt(
-                        event["encrypted_payload"], event["nonce"]
-                    )
+                if event.get("encrypted_payload") and event.get("nonce") and self.encryption_key_b64:
+                    try:
+                        plaintext = crypto_decrypt(
+                            self.encryption_key_b64, event["encrypted_payload"], event["nonce"]
+                        )
+                    except Exception:
+                        plaintext = None
                     if plaintext:
                         try:
                             payload = json.loads(plaintext)
@@ -542,11 +560,12 @@ class DeviceManager:
                 "content": content,  # Plaintext fallback
             }
 
-            # E2E: encrypt content if key exchange is ready
+            # E2E: encrypt content if encryption key is available
             attachments = msg.get("attachments")
-            encrypted = self.key_exchange.encrypt(
+            encrypted = crypto_encrypt(
+                self.encryption_key_b64,
                 json.dumps({"content": content, "attachments": attachments or []})
-            ) if self.key_exchange else None
+            ) if self.encryption_key_b64 else None
             if encrypted:
                 ct, nonce = encrypted
                 ws_msg["encrypted_payload"] = ct
@@ -593,8 +612,8 @@ class DeviceManager:
 
             # E2E: encrypt description — send via ephemeral relay, not in notification
             encrypted = None
-            if description and self.key_exchange:
-                encrypted = self.key_exchange.encrypt(description)
+            if description and self.encryption_key_b64:
+                encrypted = crypto_encrypt(self.encryption_key_b64, description)
                 if encrypted:
                     ws_msg["description"] = ""  # Don't send plaintext
 
@@ -652,10 +671,10 @@ class DeviceManager:
             }
 
             # E2E: encrypt interaction content — send via ephemeral relay
-            encrypted = self.key_exchange.encrypt(json.dumps({
+            encrypted = crypto_encrypt(self.encryption_key_b64, json.dumps({
                 "content": content,
                 "options": msg.get("options"),
-            })) if self.key_exchange else None
+            })) if self.encryption_key_b64 else None
             if encrypted:
                 ct, nonce = encrypted
                 ws_msg["content"] = ""
@@ -1243,12 +1262,10 @@ async def run_manager(
         save_device_config(config)
         log.info("X25519 keypair saved — E2E will activate on next browser key exchange")
 
-    # Build KeyExchange and restore persisted key if available
+    # Build KeyExchange for ECDH transport during rekey
     key_exchange: KeyExchange | None = None
     if config.x25519_private_b64 and config.x25519_public_b64:
         key_exchange = KeyExchange(config.x25519_private_b64, config.x25519_public_b64)
-        if config.encryption_key_b64:
-            key_exchange.restore_key(config.encryption_key_b64)
 
     log.info("Device: %s (%s)", config.device_name, config.device_id)
 
@@ -1257,6 +1274,7 @@ async def run_manager(
         private_key_b64=config.private_key_b64,
         base_url=config.base_url,
         key_exchange=key_exchange,
+        encryption_key_b64=config.encryption_key_b64,
     )
 
     # Open local database and start IPC server before connecting WebSocket
