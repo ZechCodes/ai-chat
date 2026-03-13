@@ -17,9 +17,10 @@ import logging
 import os
 import platform
 import sys
+import signal
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 import websockets
@@ -57,15 +58,37 @@ log = logging.getLogger(__name__)
 class WorkerProcess:
     """Tracks a running worker subprocess."""
 
-    proc: asyncio.subprocess.Process
+    proc: asyncio.subprocess.Process | None
     channel_id: str
     channel_token: str
     started_at: float = 0.0
     working_directory: str = ""
+    adopted: bool = False
+    adopted_pid: int | None = None
 
     def __post_init__(self):
         if not self.started_at:
             self.started_at = time.time()
+
+    @property
+    def pid(self) -> int | None:
+        if self.adopted:
+            return self.adopted_pid
+        return self.proc.pid if self.proc else None
+
+    def is_alive(self) -> bool:
+        """Check if the worker process is still running."""
+        if self.adopted:
+            if self.adopted_pid is None:
+                return False
+            try:
+                os.kill(self.adopted_pid, 0)
+                return True
+            except OSError:
+                return False
+        if self.proc is None:
+            return False
+        return self.proc.returncode is None
 
 
 def parse_device_command(event: dict) -> dict | None:
@@ -809,12 +832,12 @@ class DeviceManager:
                 return
             config.workers = {
                 cid: {
-                    "pid": w.proc.pid,
+                    "pid": w.pid,
                     "started_at": w.started_at,
                     "working_directory": w.working_directory,
                 }
                 for cid, w in self.workers.items()
-                if w.proc.pid is not None and isinstance(w.proc.pid, int)
+                if w.pid is not None and isinstance(w.pid, int)
             }
             save_device_config(config)
         except Exception as e:
@@ -889,7 +912,16 @@ class DeviceManager:
         worker = self.workers.pop(channel_id, None)
         if not worker:
             return
-        log.info("Stopping worker for channel %s", channel_id)
+        log.info("Stopping worker for channel %s (adopted=%s)", channel_id, worker.adopted)
+        if worker.adopted:
+            # Adopted worker — no proc object, signal directly
+            if worker.adopted_pid:
+                try:
+                    os.kill(worker.adopted_pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            self._save_worker_pids()
+            return
         try:
             worker.proc.terminate()
         except ProcessLookupError:
@@ -1032,14 +1064,25 @@ class DeviceManager:
             log.info("Channel %s removed from device, stopping worker", channel_id)
             await self.stop_worker(channel_id)
 
-        # Start workers for channels not yet running (unless stale PID is still alive)
+        # Start workers for channels not yet running (adopt live PIDs from previous run)
         for channel_id in server_channel_ids - local_channel_ids:
             if channel_id in saved_pids:
                 pid = saved_pids[channel_id].get("pid")
                 if pid:
                     try:
                         os.kill(pid, 0)  # Check if alive
-                        log.info("Channel %s has live worker from previous run (pid=%s), keeping it", channel_id, pid)
+                        saved_wd = saved_pids[channel_id].get("working_directory", "")
+                        saved_started = saved_pids[channel_id].get("started_at", 0.0)
+                        log.info("Adopting live worker for channel %s (pid=%s)", channel_id, pid)
+                        self.workers[channel_id] = WorkerProcess(
+                            proc=None,
+                            channel_id=channel_id,
+                            channel_token="",
+                            started_at=saved_started,
+                            working_directory=saved_wd,
+                            adopted=True,
+                            adopted_pid=pid,
+                        )
                         continue
                     except OSError:
                         pass  # Dead, start a new one
@@ -1102,8 +1145,11 @@ class DeviceManager:
     async def _check_workers(self) -> None:
         """Check for crashed workers and restart them."""
         for channel_id, worker in list(self.workers.items()):
-            if worker.proc.returncode is not None:
-                log.warning("Worker %s crashed (rc=%s), restarting", channel_id, worker.proc.returncode)
+            if not worker.is_alive():
+                if worker.adopted:
+                    log.warning("Adopted worker %s (pid=%s) died, restarting", channel_id, worker.adopted_pid)
+                else:
+                    log.warning("Worker %s crashed (rc=%s), restarting", channel_id, worker.proc.returncode)
                 await self.start_worker(channel_id, worker.channel_token, worker.working_directory)
 
     async def monitor_workers(self) -> None:
@@ -1116,11 +1162,19 @@ class DeviceManager:
     # Shutdown
     # ------------------------------------------------------------------
 
-    async def shutdown(self) -> None:
-        """Gracefully stop all workers, IPC server, and local database."""
-        log.info("Shutting down, stopping %d workers", len(self.workers))
-        for channel_id in list(self.workers.keys()):
-            await self.stop_worker(channel_id)
+    async def shutdown(self, force: bool = False) -> None:
+        """Shut down the manager. Workers are detached by default (surviving restart).
+
+        Args:
+            force: If True, terminate all workers before exiting.
+        """
+        if force:
+            log.info("Shutting down (force), stopping %d workers", len(self.workers))
+            for channel_id in list(self.workers.keys()):
+                await self.stop_worker(channel_id)
+        else:
+            log.info("Shutting down, detaching %d workers (they will keep running)", len(self.workers))
+            self._save_worker_pids()
         await self.stop_ipc()
         await self.local_db.close()
 
@@ -1188,7 +1242,7 @@ async def device_auth_flow(base_url: str) -> DeviceConfig:
         await asyncio.sleep(2)
 
 
-async def run_manager() -> None:
+async def run_manager(force_stop: bool = False) -> None:
     """Main manager entry point."""
     from aichat_crypto import generate_x25519_keypair
 
@@ -1234,11 +1288,20 @@ async def run_manager() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        await manager.shutdown()
+        await manager.shutdown(force=force_stop)
 
 
 def main() -> None:
-    asyncio.run(run_manager())
+    import argparse
+
+    parser = argparse.ArgumentParser(description="AI.CHAT Device Manager")
+    parser.add_argument(
+        "--stop",
+        action="store_true",
+        help="Kill all workers on shutdown instead of detaching them",
+    )
+    args = parser.parse_args()
+    asyncio.run(run_manager(force_stop=args.stop))
 
 
 if __name__ == "__main__":
