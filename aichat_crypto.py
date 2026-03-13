@@ -1,13 +1,10 @@
 """E2E encryption for AI.CHAT — X25519 key exchange + NaCl secretbox.
 
-Key concepts:
-- Device master key: derived via X25519 ECDH between device and browser during
-  device approval. Used to encrypt per-channel symmetric keys.
-- Channel key: random 256-bit key for XSalsa20-Poly1305 (secretbox). Each channel
-  has its own key. All message content is encrypted with the channel key.
+Single device-level key derived via X25519 ECDH between device and browser.
+All message content is encrypted with this key using XSalsa20-Poly1305 (secretbox).
 
 Crypto stack:
-- X25519 ECDH: via `cryptography` library (already a dependency)
+- X25519 ECDH: via `cryptography` library
 - HKDF-SHA256: key derivation from ECDH shared secret
 - XSalsa20-Poly1305 (NaCl secretbox): symmetric authenticated encryption via PyNaCl
 """
@@ -15,7 +12,6 @@ Crypto stack:
 from __future__ import annotations
 
 import base64
-import os
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
@@ -27,13 +23,13 @@ from cryptography.hazmat.primitives import hashes
 import nacl.secret
 import nacl.utils
 
-# Salt for HKDF derivation of device master key
+# Salt for HKDF derivation
 _HKDF_SALT = b"aichat-device-key"
 _HKDF_INFO = b"v1"
 
 
 # ------------------------------------------------------------------
-# X25519 key generation and ECDH
+# X25519 key generation
 # ------------------------------------------------------------------
 
 
@@ -52,56 +48,6 @@ def generate_x25519_keypair() -> dict[str, str]:
             public_key.public_bytes_raw()
         ).decode(),
     }
-
-
-def compute_shared_secret(
-    our_private_b64: str, their_public_b64: str
-) -> bytes:
-    """Compute the raw X25519 shared secret from our private key and their public key."""
-    private_key = X25519PrivateKey.from_private_bytes(
-        base64.b64decode(our_private_b64)
-    )
-    public_key = X25519PublicKey.from_public_bytes(
-        base64.b64decode(their_public_b64)
-    )
-    return private_key.exchange(public_key)
-
-
-def derive_device_master_key(shared_secret: bytes) -> bytes:
-    """Derive a 256-bit device master key from the ECDH shared secret using HKDF-SHA256."""
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(),
-        length=nacl.secret.SecretBox.KEY_SIZE,  # 32 bytes
-        salt=_HKDF_SALT,
-        info=_HKDF_INFO,
-    )
-    return hkdf.derive(shared_secret)
-
-
-def derive_device_master_key_b64(
-    our_private_b64: str, their_public_b64: str
-) -> str:
-    """One-shot: compute ECDH shared secret and derive device master key.
-
-    Returns base64-encoded 32-byte key.
-    """
-    shared = compute_shared_secret(our_private_b64, their_public_b64)
-    key = derive_device_master_key(shared)
-    return base64.b64encode(key).decode()
-
-
-# ------------------------------------------------------------------
-# Channel key generation
-# ------------------------------------------------------------------
-
-
-def generate_channel_key() -> str:
-    """Generate a random 256-bit channel encryption key.
-
-    Returns base64-encoded 32-byte key.
-    """
-    key = os.urandom(nacl.secret.SecretBox.KEY_SIZE)
-    return base64.b64encode(key).decode()
 
 
 # ------------------------------------------------------------------
@@ -151,27 +97,88 @@ def decrypt(key_b64: str, ciphertext_b64: str, nonce_b64: str) -> str:
 
 
 # ------------------------------------------------------------------
-# Convenience: encrypt/decrypt channel keys with device master key
+# Private helpers for ECDH key derivation
 # ------------------------------------------------------------------
 
 
-def encrypt_channel_key(
-    device_master_key_b64: str, channel_key_b64: str
-) -> tuple[str, str]:
-    """Encrypt a channel key with the device master key.
+def _compute_shared_secret(
+    our_private_b64: str, their_public_b64: str
+) -> bytes:
+    """Compute the raw X25519 shared secret from our private key and their public key."""
+    private_key = X25519PrivateKey.from_private_bytes(
+        base64.b64decode(our_private_b64)
+    )
+    public_key = X25519PublicKey.from_public_bytes(
+        base64.b64decode(their_public_b64)
+    )
+    return private_key.exchange(public_key)
 
-    Returns (encrypted_key_b64, nonce_b64).
+
+def _derive_key(shared_secret: bytes) -> bytes:
+    """Derive a 256-bit key from the ECDH shared secret using HKDF-SHA256."""
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=nacl.secret.SecretBox.KEY_SIZE,  # 32 bytes
+        salt=_HKDF_SALT,
+        info=_HKDF_INFO,
+    )
+    return hkdf.derive(shared_secret)
+
+
+# ------------------------------------------------------------------
+# KeyExchange — single device-level key abstraction
+# ------------------------------------------------------------------
+
+
+class KeyExchange:
+    """Manages the X25519 ECDH key exchange and provides encrypt/decrypt.
+
+    Lifecycle:
+    1. Created with device's X25519 keypair
+    2. Either restore_key() from persisted config, or complete_exchange() with browser's public key
+    3. Once ready, encrypt/decrypt work with the derived key
     """
-    return encrypt(device_master_key_b64, channel_key_b64)
 
+    def __init__(self, x25519_private_b64: str, x25519_public_b64: str):
+        self._private_b64 = x25519_private_b64
+        self.public_key_b64 = x25519_public_b64
+        self._key_b64: str | None = None
 
-def decrypt_channel_key(
-    device_master_key_b64: str,
-    encrypted_key_b64: str,
-    nonce_b64: str,
-) -> str:
-    """Decrypt a channel key using the device master key.
+    @property
+    def is_ready(self) -> bool:
+        return self._key_b64 is not None
 
-    Returns the plaintext channel_key_b64 string.
-    """
-    return decrypt(device_master_key_b64, encrypted_key_b64, nonce_b64)
+    @property
+    def key_b64(self) -> str | None:
+        return self._key_b64
+
+    def restore_key(self, key_b64: str) -> None:
+        """Load a previously derived key from persistent storage."""
+        if key_b64:
+            self._key_b64 = key_b64
+
+    def complete_exchange(self, their_public_b64: str) -> str:
+        """Complete the ECDH exchange with the other party's public key.
+
+        Idempotent: same inputs always produce the same key.
+        Returns the derived key as base64.
+        """
+        shared = _compute_shared_secret(self._private_b64, their_public_b64)
+        key = _derive_key(shared)
+        self._key_b64 = base64.b64encode(key).decode()
+        return self._key_b64
+
+    def encrypt(self, plaintext: str) -> tuple[str, str] | None:
+        """Encrypt plaintext. Returns (ciphertext_b64, nonce_b64) or None if not ready."""
+        if not self._key_b64:
+            return None
+        return encrypt(self._key_b64, plaintext)
+
+    def decrypt(self, ciphertext_b64: str, nonce_b64: str) -> str | None:
+        """Decrypt ciphertext. Returns plaintext or None if not ready."""
+        if not self._key_b64:
+            return None
+        try:
+            return decrypt(self._key_b64, ciphertext_b64, nonce_b64)
+        except Exception:
+            return None

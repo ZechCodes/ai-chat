@@ -16,7 +16,7 @@ from pathlib import Path
 import httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from aichat_crypto import derive_device_master_key_b64, generate_x25519_keypair
+from aichat_crypto import generate_x25519_keypair
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "aichat" / "device.json"
 
@@ -34,8 +34,8 @@ class DeviceConfig:
     # X25519 private key for E2E key exchange (persisted for re-keying)
     x25519_private_b64: str = ""
     x25519_public_b64: str = ""
-    # Device master key derived from ECDH (encrypts channel keys)
-    device_master_key_b64: str = ""
+    # Encryption key derived from ECDH (encrypts all message content)
+    encryption_key_b64: str = ""
 
 
 def generate_device_keypair() -> dict:
@@ -69,7 +69,10 @@ def load_device_config(path: Path = DEFAULT_CONFIG_PATH) -> DeviceConfig | None:
         data.setdefault("workers", {})
         data.setdefault("x25519_private_b64", "")
         data.setdefault("x25519_public_b64", "")
-        data.setdefault("device_master_key_b64", "")
+        # Migrate old field name
+        if "device_master_key_b64" in data:
+            data.setdefault("encryption_key_b64", data.pop("device_master_key_b64"))
+        data.setdefault("encryption_key_b64", "")
         return DeviceConfig(**data)
     except Exception:
         return None

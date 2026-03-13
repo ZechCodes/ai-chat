@@ -101,13 +101,13 @@ async def test_save_and_get_channel(db: LocalDB):
 
 
 @pytest.mark.asyncio
-async def test_channel_upsert_preserves_key(db: LocalDB):
-    await db.save_channel("chan-1", "Test", channel_key_b64="secret-key")
-    # Update name without providing key
+async def test_channel_upsert_preserves_working_directory(db: LocalDB):
+    await db.save_channel("chan-1", "Test", working_directory="/projects/foo")
+    # Update name without providing working_directory
     await db.save_channel("chan-1", "Updated Name")
     channel = await db.get_channel("chan-1")
     assert channel["name"] == "Updated Name"
-    assert channel["channel_key_b64"] == "secret-key"
+    assert channel["working_directory"] == "/projects/foo"
 
 
 @pytest.mark.asyncio

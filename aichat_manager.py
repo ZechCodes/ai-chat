@@ -20,13 +20,12 @@ import sys
 import signal
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-import httpx
 import websockets
 
 from aichat_api import AiChatAPI
-from aichat_crypto import encrypt, encrypt_channel_key, decrypt, generate_channel_key
+from aichat_crypto import KeyExchange
 from aichat_db import LocalDB
 from aichat_device_auth import (
     DeviceConfig,
@@ -153,13 +152,11 @@ class DeviceManager:
     """Manages worker processes on this device."""
 
     def __init__(self, device_id: str, private_key_b64: str, base_url: str,
-                 device_master_key_b64: str = "",
-                 x25519_private_b64: str = ""):
+                 key_exchange: KeyExchange | None = None):
         self.device_id = device_id
         self.private_key_b64 = private_key_b64
         self.base_url = base_url
-        self.device_master_key_b64 = device_master_key_b64
-        self.x25519_private_b64 = x25519_private_b64
+        self.key_exchange = key_exchange
         self.workers: dict[str, WorkerProcess] = {}
         self.last_event_ts: str | None = None
 
@@ -245,15 +242,12 @@ class DeviceManager:
 
     async def _push_x25519_public(self) -> None:
         """Push device X25519 public key to server if available."""
-        if not self.x25519_private_b64:
-            return
-        config = load_device_config()
-        if not config or not config.x25519_public_b64:
+        if not self.key_exchange:
             return
         try:
             await self._ws_request({
                 "type": "update_device_x25519",
-                "x25519_public": config.x25519_public_b64,
+                "x25519_public": self.key_exchange.public_key_b64,
             })
             log.info("Pushed X25519 public key to server")
         except Exception as e:
@@ -339,50 +333,31 @@ class DeviceManager:
     async def _handle_rekey_request(self, event: dict) -> None:
         """Handle a re-key request from a new browser session.
 
-        Browser sends its X25519 public key. We compute a new shared secret,
-        re-encrypt all channel keys, and send them back.
+        Browser sends its X25519 public key. We complete the ECDH exchange,
+        persist the new key, and ack.
         """
-        from aichat_crypto import derive_device_master_key_b64 as derive_key
-
         browser_x25519_public = event.get("browser_x25519_public", "")
         request_id = event.get("request_id", "")
 
-        if not browser_x25519_public or not self.x25519_private_b64:
+        if not browser_x25519_public or not self.key_exchange:
             log.warning("Re-key request missing browser key or device X25519 key")
             return
 
         try:
-            # Compute new shared secret with the browser's ephemeral key
-            new_master = derive_key(self.x25519_private_b64, browser_x25519_public)
+            new_key = self.key_exchange.complete_exchange(browser_x25519_public)
 
-            # Update in-memory master key and persist to device.json
-            self.device_master_key_b64 = new_master
+            # Persist to device.json
             config = load_device_config()
             if config:
-                config.device_master_key_b64 = new_master
+                config.encryption_key_b64 = new_key
                 save_device_config(config)
 
-            # Re-encrypt all channel keys with the new master key
-            encrypted_keys = {}
-            channels = await self.local_db.list_channels()
-            for ch in channels:
-                ch_key = ch.get("channel_key_b64")
-                if ch_key:
-                    ct, nonce = encrypt_channel_key(new_master, ch_key)
-                    encrypted_keys[ch["id"]] = {
-                        "encrypted_key": ct,
-                        "nonce": nonce,
-                    }
-                    # Also upload to server so chat page can serve them
-                    await self._upload_encrypted_channel_key(ch["id"], ch_key)
-
-            # Send back via WebSocket
+            # Ack the rekey
             await self._ws_fire_and_forget({
                 "type": "rekey_response",
                 "request_id": request_id,
-                "encrypted_keys": encrypted_keys,
             })
-            log.info("Sent re-key response with %d channel keys", len(encrypted_keys))
+            log.info("Re-key complete")
 
         except Exception as e:
             log.warning("Re-key failed: %s", e)
@@ -408,7 +383,6 @@ class DeviceManager:
             messages = messages[:limit]
 
             # Encrypt each message for the browser
-            channel_key = await self._get_channel_key(channel_id)
             encrypted_messages = []
             for msg in messages:
                 msg_data = {
@@ -418,12 +392,13 @@ class DeviceManager:
                     "read_by_user_at": msg.get("read_by_user_at"),
                     "read_by_claude_at": msg.get("read_by_claude_at"),
                 }
-                if channel_key:
-                    payload = json.dumps({
-                        "content": msg["content"],
-                        "attachments": json.loads(msg["attachments"]) if msg.get("attachments") else None,
-                    })
-                    ct, nonce = encrypt(channel_key, payload)
+                payload = json.dumps({
+                    "content": msg["content"],
+                    "attachments": json.loads(msg["attachments"]) if msg.get("attachments") else None,
+                })
+                encrypted = self.key_exchange.encrypt(payload) if self.key_exchange else None
+                if encrypted:
+                    ct, nonce = encrypted
                     msg_data["encrypted_payload"] = ct
                     msg_data["nonce"] = nonce
                 else:
@@ -461,11 +436,9 @@ class DeviceManager:
 
         content = ""
         attachments = None
-        channel_key = await self._get_channel_key(channel_id)
-        if channel_key:
+        if self.key_exchange:
             try:
-                from aichat_crypto import decrypt
-                plain = decrypt(channel_key, encrypted_payload, nonce)
+                plain = self.key_exchange.decrypt(encrypted_payload, nonce)
                 if plain:
                     payload = json.loads(plain)
                     content = payload.get("content", "")
@@ -512,10 +485,9 @@ class DeviceManager:
                 attachments = event.get("attachments")
 
                 # Decrypt if encrypted
-                if event.get("encrypted_payload") and event.get("nonce"):
-                    channel_id = event.get("channel_id", "")
-                    plaintext = await self._decrypt_content(
-                        channel_id, event["encrypted_payload"], event["nonce"]
+                if event.get("encrypted_payload") and event.get("nonce") and self.key_exchange:
+                    plaintext = self.key_exchange.decrypt(
+                        event["encrypted_payload"], event["nonce"]
                     )
                     if plaintext:
                         try:
@@ -555,35 +527,6 @@ class DeviceManager:
             log.warning("Failed to store event locally: %s", e)
 
     # ------------------------------------------------------------------
-    # E2E encryption helpers
-    # ------------------------------------------------------------------
-
-    async def _get_channel_key(self, channel_id: str) -> str | None:
-        """Get the plaintext channel encryption key from local DB."""
-        channel = await self.local_db.get_channel(channel_id)
-        if channel and channel.get("channel_key_b64"):
-            return channel["channel_key_b64"]
-        return None
-
-    async def _encrypt_content(self, channel_id: str, content: str) -> tuple[str, str] | None:
-        """Encrypt content with the channel key. Returns (ciphertext_b64, nonce_b64) or None."""
-        key = await self._get_channel_key(channel_id)
-        if not key:
-            return None
-        return encrypt(key, content)
-
-    async def _decrypt_content(self, channel_id: str, ciphertext_b64: str, nonce_b64: str) -> str | None:
-        """Decrypt content with the channel key. Returns plaintext or None."""
-        key = await self._get_channel_key(channel_id)
-        if not key:
-            return None
-        try:
-            return decrypt(key, ciphertext_b64, nonce_b64)
-        except Exception as e:
-            log.warning("Failed to decrypt content for channel %s: %s", channel_id, e)
-            return None
-
-    # ------------------------------------------------------------------
     # IPC: worker request proxying
     # ------------------------------------------------------------------
 
@@ -599,13 +542,11 @@ class DeviceManager:
                 "content": content,  # Plaintext fallback
             }
 
-            # E2E: encrypt content if channel key available
-            # Wrap in {content, attachments} to match browser encryption format
+            # E2E: encrypt content if key exchange is ready
             attachments = msg.get("attachments")
-            encrypted = await self._encrypt_content(
-                channel_id,
-                json.dumps({"content": content, "attachments": attachments or []}),
-            )
+            encrypted = self.key_exchange.encrypt(
+                json.dumps({"content": content, "attachments": attachments or []})
+            ) if self.key_exchange else None
             if encrypted:
                 ct, nonce = encrypted
                 ws_msg["encrypted_payload"] = ct
@@ -628,6 +569,7 @@ class DeviceManager:
 
             # E2E: send encrypted content via ephemeral relay (separate from notification)
             if encrypted:
+                ct, nonce = encrypted
                 await self._ws_fire_and_forget({
                     "type": "relay_content",
                     "channel_id": channel_id,
@@ -651,8 +593,8 @@ class DeviceManager:
 
             # E2E: encrypt description — send via ephemeral relay, not in notification
             encrypted = None
-            if description:
-                encrypted = await self._encrypt_content(channel_id, description)
+            if description and self.key_exchange:
+                encrypted = self.key_exchange.encrypt(description)
                 if encrypted:
                     ws_msg["description"] = ""  # Don't send plaintext
 
@@ -710,10 +652,10 @@ class DeviceManager:
             }
 
             # E2E: encrypt interaction content — send via ephemeral relay
-            encrypted = await self._encrypt_content(channel_id, json.dumps({
+            encrypted = self.key_exchange.encrypt(json.dumps({
                 "content": content,
                 "options": msg.get("options"),
-            }))
+            })) if self.key_exchange else None
             if encrypted:
                 ct, nonce = encrypted
                 ws_msg["content"] = ""
@@ -723,6 +665,7 @@ class DeviceManager:
 
             # Send encrypted content via ephemeral relay
             if encrypted:
+                ct, nonce = encrypted
                 await self._ws_fire_and_forget({
                     "type": "relay_content",
                     "channel_id": channel_id,
@@ -986,17 +929,12 @@ class DeviceManager:
             wd = channel.get("working_directory", working_directory)
             log.info("Created channel %s (%s)", channel["name"], channel_id)
 
-            # Sync to local DB and generate encryption key
-            channel_key_b64 = generate_channel_key()
-            if self.device_master_key_b64:
-                await self._upload_encrypted_channel_key(channel_id, channel_key_b64)
-
+            # Sync to local DB
             await self.local_db.save_channel(
                 channel_id=channel_id,
                 name=channel["name"],
                 device_id=self.device_id,
                 working_directory=wd,
-                channel_key_b64=channel_key_b64,
             )
 
             await self.start_worker(channel_id, working_directory=wd)
@@ -1091,27 +1029,14 @@ class DeviceManager:
 
         server_channels = {ch["id"]: ch for ch in data.get("channels", [])}
 
-        # Dual-write: sync channel metadata to local DB and generate encryption keys
+        # Sync channel metadata to local DB
         for ch_id, ch_info in server_channels.items():
             try:
-                existing = await self.local_db.get_channel(ch_id)
-                channel_key_b64 = existing["channel_key_b64"] if existing and existing.get("channel_key_b64") else None
-
-                # Generate channel key if missing
-                if not channel_key_b64:
-                    channel_key_b64 = generate_channel_key()
-                    log.info("Generated encryption key for channel %s", ch_id)
-
-                    # Upload encrypted channel key to server if we have a device master key
-                    if self.device_master_key_b64:
-                        await self._upload_encrypted_channel_key(ch_id, channel_key_b64)
-
                 await self.local_db.save_channel(
                     channel_id=ch_id,
                     name=ch_info.get("name", ""),
                     device_id=self.device_id,
                     working_directory=ch_info.get("working_directory"),
-                    channel_key_b64=channel_key_b64,
                 )
             except Exception as e:
                 log.warning("Failed to sync channel %s to local DB: %s", ch_id, e)
@@ -1160,24 +1085,6 @@ class DeviceManager:
             working_directory = ch_info.get("working_directory", "")
             log.info("Channel %s assigned to device, starting worker (cwd=%s)", channel_id, working_directory or "<default>")
             await self.start_worker(channel_id, working_directory=working_directory)
-
-    async def _upload_encrypted_channel_key(
-        self, channel_id: str, channel_key_b64: str
-    ) -> None:
-        """Encrypt a channel key with the device master key and upload to server."""
-        try:
-            enc_key, nonce = encrypt_channel_key(
-                self.device_master_key_b64, channel_key_b64
-            )
-            await self._ws_request({
-                "type": "register_channel_key",
-                "channel_id": channel_id,
-                "encrypted_channel_key": enc_key,
-                "key_nonce": nonce,
-            })
-            log.info("Uploaded encrypted key for channel %s", channel_id)
-        except Exception as e:
-            log.warning("Failed to upload channel key for %s: %s", channel_id, e)
 
     async def report_status(self) -> None:
         """Report device status to the server via WebSocket."""
@@ -1251,7 +1158,7 @@ class DeviceManager:
 
 async def device_auth_flow(base_url: str) -> DeviceConfig:
     """Run the interactive device auth flow with X25519 key exchange."""
-    from aichat_crypto import derive_device_master_key_b64, generate_x25519_keypair
+    from aichat_crypto import KeyExchange, generate_x25519_keypair
 
     device_name = platform.node() or "Unknown Device"
     keypair = generate_device_keypair()
@@ -1283,14 +1190,13 @@ async def device_auth_flow(base_url: str) -> DeviceConfig:
         if status["status"] == "approved":
             log.info("Device approved!")
 
-            # Derive device master key from ECDH if browser provided its X25519 public key
-            device_master_key_b64 = ""
+            # Complete key exchange if browser provided its X25519 public key
+            encryption_key_b64 = ""
             browser_x25519_public = status.get("browser_x25519_public", "")
             if browser_x25519_public:
-                device_master_key_b64 = derive_device_master_key_b64(
-                    x25519_kp["private_key_b64"], browser_x25519_public
-                )
-                log.info("E2E key exchange completed — device master key derived")
+                kx = KeyExchange(x25519_kp["private_key_b64"], x25519_kp["public_key_b64"])
+                encryption_key_b64 = kx.complete_exchange(browser_x25519_public)
+                log.info("E2E key exchange completed")
             else:
                 log.warning("Browser did not provide X25519 public key — E2E encryption unavailable")
 
@@ -1302,7 +1208,7 @@ async def device_auth_flow(base_url: str) -> DeviceConfig:
                 base_url=base_url,
                 x25519_private_b64=x25519_kp["private_key_b64"],
                 x25519_public_b64=x25519_kp["public_key_b64"],
-                device_master_key_b64=device_master_key_b64,
+                encryption_key_b64=encryption_key_b64,
             )
             save_device_config(config)
             return config
@@ -1318,7 +1224,7 @@ async def run_manager(
     create_channel_wd: str = "",
 ) -> None:
     """Main manager entry point."""
-    from aichat_crypto import generate_x25519_keypair
+    from aichat_crypto import KeyExchange, generate_x25519_keypair
 
     base_url = os.environ.get("AICHAT_URL", "https://aichat.zech.sh")
 
@@ -1333,10 +1239,16 @@ async def run_manager(
         x25519_kp = generate_x25519_keypair()
         config.x25519_private_b64 = x25519_kp["private_key_b64"]
         config.x25519_public_b64 = x25519_kp["public_key_b64"]
-        # Clear any stale master key — it'll be derived on first rekey
-        config.device_master_key_b64 = ""
+        config.encryption_key_b64 = ""
         save_device_config(config)
         log.info("X25519 keypair saved — E2E will activate on next browser key exchange")
+
+    # Build KeyExchange and restore persisted key if available
+    key_exchange: KeyExchange | None = None
+    if config.x25519_private_b64 and config.x25519_public_b64:
+        key_exchange = KeyExchange(config.x25519_private_b64, config.x25519_public_b64)
+        if config.encryption_key_b64:
+            key_exchange.restore_key(config.encryption_key_b64)
 
     log.info("Device: %s (%s)", config.device_name, config.device_id)
 
@@ -1344,8 +1256,7 @@ async def run_manager(
         device_id=config.device_id,
         private_key_b64=config.private_key_b64,
         base_url=config.base_url,
-        device_master_key_b64=config.device_master_key_b64,
-        x25519_private_b64=config.x25519_private_b64,
+        key_exchange=key_exchange,
     )
 
     # Open local database and start IPC server before connecting WebSocket

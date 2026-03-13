@@ -1,18 +1,14 @@
-"""Tests for aichat_crypto — E2E encryption primitives."""
+"""Tests for aichat_crypto — E2E encryption primitives and KeyExchange."""
 
 from __future__ import annotations
 
 import base64
+import os
 
 from aichat_crypto import (
-    compute_shared_secret,
+    KeyExchange,
     decrypt,
-    decrypt_channel_key,
-    derive_device_master_key,
-    derive_device_master_key_b64,
     encrypt,
-    encrypt_channel_key,
-    generate_channel_key,
     generate_x25519_keypair,
 )
 
@@ -26,57 +22,8 @@ def test_x25519_keypair_generation():
     assert len(base64.b64decode(kp["public_key_b64"])) == 32
 
 
-def test_ecdh_shared_secret_matches():
-    """Both sides of the ECDH exchange should derive the same shared secret."""
-    alice = generate_x25519_keypair()
-    bob = generate_x25519_keypair()
-
-    secret_a = compute_shared_secret(alice["private_key_b64"], bob["public_key_b64"])
-    secret_b = compute_shared_secret(bob["private_key_b64"], alice["public_key_b64"])
-
-    assert secret_a == secret_b
-    assert len(secret_a) == 32
-
-
-def test_derive_device_master_key():
-    alice = generate_x25519_keypair()
-    bob = generate_x25519_keypair()
-
-    shared = compute_shared_secret(alice["private_key_b64"], bob["public_key_b64"])
-    key = derive_device_master_key(shared)
-    assert len(key) == 32
-
-    # Same shared secret should always produce the same key
-    key2 = derive_device_master_key(shared)
-    assert key == key2
-
-
-def test_derive_device_master_key_b64_matches_both_sides():
-    """The one-shot derivation should match on both sides."""
-    device = generate_x25519_keypair()
-    browser = generate_x25519_keypair()
-
-    device_key = derive_device_master_key_b64(
-        device["private_key_b64"], browser["public_key_b64"]
-    )
-    browser_key = derive_device_master_key_b64(
-        browser["private_key_b64"], device["public_key_b64"]
-    )
-
-    assert device_key == browser_key
-    assert len(base64.b64decode(device_key)) == 32
-
-
-def test_generate_channel_key():
-    key = generate_channel_key()
-    assert len(base64.b64decode(key)) == 32
-    # Should be random each time
-    key2 = generate_channel_key()
-    assert key != key2
-
-
 def test_encrypt_decrypt_roundtrip():
-    key = generate_channel_key()
+    key = base64.b64encode(os.urandom(32)).decode()
     plaintext = "Hello, world! This is a secret message."
 
     ciphertext, nonce = encrypt(key, plaintext)
@@ -87,7 +34,7 @@ def test_encrypt_decrypt_roundtrip():
 
 def test_encrypt_produces_different_ciphertext():
     """Each encryption should use a random nonce, producing different ciphertext."""
-    key = generate_channel_key()
+    key = base64.b64encode(os.urandom(32)).decode()
     plaintext = "Same message"
 
     ct1, n1 = encrypt(key, plaintext)
@@ -97,8 +44,8 @@ def test_encrypt_produces_different_ciphertext():
 
 
 def test_decrypt_with_wrong_key_fails():
-    key1 = generate_channel_key()
-    key2 = generate_channel_key()
+    key1 = base64.b64encode(os.urandom(32)).decode()
+    key2 = base64.b64encode(os.urandom(32)).decode()
     plaintext = "Secret"
 
     ct, nonce = encrypt(key1, plaintext)
@@ -111,7 +58,7 @@ def test_decrypt_with_wrong_key_fails():
 
 
 def test_encrypt_decrypt_unicode():
-    key = generate_channel_key()
+    key = base64.b64encode(os.urandom(32)).decode()
     plaintext = "Unicode test: \u2603\u2764\ufe0f\U0001f680 \u65e5\u672c\u8a9e"
 
     ct, nonce = encrypt(key, plaintext)
@@ -119,61 +66,117 @@ def test_encrypt_decrypt_unicode():
 
 
 def test_encrypt_decrypt_empty_string():
-    key = generate_channel_key()
+    key = base64.b64encode(os.urandom(32)).decode()
     ct, nonce = encrypt(key, "")
     assert decrypt(key, ct, nonce) == ""
 
 
 def test_encrypt_decrypt_large_message():
-    key = generate_channel_key()
+    key = base64.b64encode(os.urandom(32)).decode()
     plaintext = "x" * 100_000  # 100KB message
 
     ct, nonce = encrypt(key, plaintext)
     assert decrypt(key, ct, nonce) == plaintext
 
 
-def test_channel_key_encryption_roundtrip():
-    """Channel keys encrypted with device master key should roundtrip."""
+# ------------------------------------------------------------------
+# KeyExchange tests
+# ------------------------------------------------------------------
+
+
+def test_key_exchange_lifecycle():
+    """Full lifecycle: generate keypairs, exchange, encrypt, decrypt."""
     device = generate_x25519_keypair()
     browser = generate_x25519_keypair()
 
-    master_key = derive_device_master_key_b64(
-        device["private_key_b64"], browser["public_key_b64"]
-    )
-    channel_key = generate_channel_key()
+    device_kx = KeyExchange(device["private_key_b64"], device["public_key_b64"])
+    browser_kx = KeyExchange(browser["private_key_b64"], browser["public_key_b64"])
 
-    encrypted, nonce = encrypt_channel_key(master_key, channel_key)
-    decrypted = decrypt_channel_key(master_key, encrypted, nonce)
+    assert not device_kx.is_ready
+    assert not browser_kx.is_ready
 
-    assert decrypted == channel_key
+    # Complete exchange on both sides
+    device_key = device_kx.complete_exchange(browser["public_key_b64"])
+    browser_key = browser_kx.complete_exchange(device["public_key_b64"])
+
+    assert device_kx.is_ready
+    assert browser_kx.is_ready
+    assert device_key == browser_key
+    assert len(base64.b64decode(device_key)) == 32
+
+    # Device encrypts, browser decrypts
+    message = "Hello from the agent!"
+    encrypted = device_kx.encrypt(message)
+    assert encrypted is not None
+    ct, nonce = encrypted
+    decrypted = browser_kx.decrypt(ct, nonce)
+    assert decrypted == message
+
+
+def test_rekey_idempotent():
+    """Same inputs to complete_exchange always produce the same key."""
+    device = generate_x25519_keypair()
+    browser = generate_x25519_keypair()
+
+    kx = KeyExchange(device["private_key_b64"], device["public_key_b64"])
+    key1 = kx.complete_exchange(browser["public_key_b64"])
+    key2 = kx.complete_exchange(browser["public_key_b64"])
+
+    assert key1 == key2
+
+
+def test_encrypt_before_exchange_returns_none():
+    """Encrypt/decrypt should return None before key exchange is completed."""
+    kp = generate_x25519_keypair()
+    kx = KeyExchange(kp["private_key_b64"], kp["public_key_b64"])
+
+    assert kx.encrypt("hello") is None
+    assert kx.decrypt("abc", "def") is None
+
+
+def test_restore_key():
+    """restore_key should make the exchange ready without ECDH."""
+    device = generate_x25519_keypair()
+    browser = generate_x25519_keypair()
+
+    # First: do a real exchange to get a key
+    kx1 = KeyExchange(device["private_key_b64"], device["public_key_b64"])
+    key = kx1.complete_exchange(browser["public_key_b64"])
+
+    # Second: restore from persisted key
+    kx2 = KeyExchange(device["private_key_b64"], device["public_key_b64"])
+    assert not kx2.is_ready
+    kx2.restore_key(key)
+    assert kx2.is_ready
+    assert kx2.key_b64 == key
+
+    # Should be able to encrypt/decrypt
+    encrypted = kx2.encrypt("test message")
+    assert encrypted is not None
+    ct, nonce = encrypted
+    assert kx1.decrypt(ct, nonce) == "test message"
 
 
 def test_full_e2e_flow():
-    """Simulate the full flow: ECDH → master key → channel key → message encryption."""
+    """Simulate the full flow: ECDH → encrypt message, no channel key layer."""
     # 1. Device and browser do ECDH
     device_kp = generate_x25519_keypair()
     browser_kp = generate_x25519_keypair()
 
-    device_master = derive_device_master_key_b64(
-        device_kp["private_key_b64"], browser_kp["public_key_b64"]
-    )
-    browser_master = derive_device_master_key_b64(
-        browser_kp["private_key_b64"], device_kp["public_key_b64"]
-    )
-    assert device_master == browser_master
+    device_kx = KeyExchange(device_kp["private_key_b64"], device_kp["public_key_b64"])
+    browser_kx = KeyExchange(browser_kp["private_key_b64"], browser_kp["public_key_b64"])
 
-    # 2. Device generates channel key, encrypts it for storage
-    channel_key = generate_channel_key()
-    enc_ck, ck_nonce = encrypt_channel_key(device_master, channel_key)
+    device_kx.complete_exchange(browser_kp["public_key_b64"])
+    browser_kx.complete_exchange(device_kp["public_key_b64"])
 
-    # 3. Browser retrieves encrypted channel key and decrypts
-    browser_channel_key = decrypt_channel_key(browser_master, enc_ck, ck_nonce)
-    assert browser_channel_key == channel_key
+    assert device_kx.key_b64 == browser_kx.key_b64
 
-    # 4. Device encrypts a message with the channel key
+    # 2. Device encrypts a message
     message = "Hello from the agent!"
-    ct, msg_nonce = encrypt(channel_key, message)
+    encrypted = device_kx.encrypt(message)
+    assert encrypted is not None
+    ct, nonce = encrypted
 
-    # 5. Browser decrypts the message with the same channel key
-    decrypted = decrypt(browser_channel_key, ct, msg_nonce)
+    # 3. Browser decrypts the message
+    decrypted = browser_kx.decrypt(ct, nonce)
     assert decrypted == message
