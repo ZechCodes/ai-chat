@@ -935,6 +935,76 @@ class DeviceManager:
             await worker.proc.wait()
         self._save_worker_pids()
 
+    async def rename_device(self, name: str) -> bool:
+        """Rename this device via WebSocket."""
+        try:
+            data = await self._ws_request({
+                "type": "rename_device",
+                "name": name,
+            })
+            device = data["device"]
+            log.info("Device renamed to %s", device["name"])
+            # Update local config
+            config = load_device_config()
+            if config:
+                config.device_name = device["name"]
+                save_device_config(config)
+            return True
+        except Exception as e:
+            log.error("Failed to rename device: %s", e)
+            return False
+
+    async def delete_device(self) -> bool:
+        """Delete this device via WebSocket. Stops all workers first."""
+        try:
+            # Stop all workers
+            for channel_id in list(self.workers):
+                await self.stop_worker(channel_id)
+            await self._ws_request({"type": "delete_device"})
+            log.info("Device deleted from server")
+            # Remove local config
+            import pathlib
+            config_path = pathlib.Path.home() / ".config" / "aichat" / "device.json"
+            if config_path.exists():
+                config_path.unlink()
+                log.info("Local device config removed")
+            return True
+        except Exception as e:
+            log.error("Failed to delete device: %s", e)
+            return False
+
+    async def create_channel(self, name: str, working_directory: str = "") -> str | None:
+        """Create a new channel via WebSocket and start its worker."""
+        try:
+            data = await self._ws_request({
+                "type": "create_channel",
+                "name": name,
+                "working_directory": working_directory,
+            })
+            channel = data["channel"]
+            channel_id = channel["id"]
+            wd = channel.get("working_directory", working_directory)
+            log.info("Created channel %s (%s)", channel["name"], channel_id)
+
+            # Sync to local DB and generate encryption key
+            channel_key_b64 = generate_channel_key()
+            if self.device_master_key_b64:
+                await self._upload_encrypted_channel_key(channel_id, channel_key_b64)
+
+            await self.local_db.save_channel(
+                channel_id=channel_id,
+                name=channel["name"],
+                device_id=self.device_id,
+                working_directory=wd,
+                channel_key_b64=channel_key_b64,
+            )
+
+            await self.start_worker(channel_id, working_directory=wd)
+            return channel_id
+        except Exception as e:
+            log.error("Failed to create channel: %s", e)
+            return None
+
     async def handle_command(self, cmd: dict) -> None:
         """Handle a parsed device command."""
         command = cmd["command"]
@@ -1242,7 +1312,11 @@ async def device_auth_flow(base_url: str) -> DeviceConfig:
         await asyncio.sleep(2)
 
 
-async def run_manager(force_stop: bool = False) -> None:
+async def run_manager(
+    force_stop: bool = False,
+    create_channel_name: str | None = None,
+    create_channel_wd: str = "",
+) -> None:
     """Main manager entry point."""
     from aichat_crypto import generate_x25519_keypair
 
@@ -1278,13 +1352,80 @@ async def run_manager(force_stop: bool = False) -> None:
     await manager.local_db.open()
     await manager.start_ipc()
 
+    async def handle_stdin(mgr: DeviceManager) -> None:
+        """Read commands from stdin (non-blocking)."""
+        loop = asyncio.get_event_loop()
+        reader = asyncio.StreamReader()
+        await loop.connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(reader), sys.stdin
+        )
+        while True:
+            try:
+                line_bytes = await reader.readline()
+                if not line_bytes:
+                    return  # EOF
+                line = line_bytes.decode().strip()
+                if not line:
+                    continue
+                parts = line.split(None, 2)
+                cmd = parts[0].lower()
+                if cmd in ("new", "create"):
+                    name = parts[1] if len(parts) > 1 else ""
+                    wd = parts[2] if len(parts) > 2 else ""
+                    await mgr.create_channel(name, wd)
+                elif cmd == "rename":
+                    name = " ".join(parts[1:]) if len(parts) > 1 else ""
+                    if not name:
+                        print("Usage: rename <new name>")
+                    else:
+                        await mgr.rename_device(name)
+                elif cmd == "delete":
+                    confirm = parts[1] if len(parts) > 1 else ""
+                    if confirm != "confirm":
+                        print("This will delete the device and all workers.")
+                        print("Type 'delete confirm' to proceed.")
+                    else:
+                        if await mgr.delete_device():
+                            print("Device deleted. Exiting.")
+                            return
+                elif cmd == "status":
+                    status = mgr.get_status()
+                    for w in status["workers"]:
+                        mem = f" ({w['memory_mb']}MB)" if "memory_mb" in w else ""
+                        print(f"  {w['channel_id']}  {w['status']}  uptime={w['uptime']}s{mem}")
+                    if not status["workers"]:
+                        print("  No workers running")
+                elif cmd in ("help", "?"):
+                    print("Commands:")
+                    print("  new <name> [working_directory]  — create a channel and start a worker")
+                    print("  rename <name>                   — rename this device")
+                    print("  delete confirm                  — delete this device and exit")
+                    print("  status                          — show worker status")
+                    print("  help                            — show this help")
+                else:
+                    print(f"Unknown command: {cmd}  (try 'help')")
+            except Exception as e:
+                log.warning("stdin handler error: %s", e)
+
+    async def create_on_startup(mgr: DeviceManager, name: str, wd: str) -> None:
+        """Wait for WebSocket connection, then create a channel."""
+        # Wait until the WS is connected and initial sync is done
+        while not mgr._ws:
+            await asyncio.sleep(0.2)
+        # Small delay to let initial sync complete
+        await asyncio.sleep(1)
+        await mgr.create_channel(name, wd)
+
     try:
-        # WebSocket connection loop and worker monitor run concurrently.
+        # WebSocket connection loop, worker monitor, and stdin handler run concurrently.
         # connect_websocket handles initial sync (report_status + sync_channels)
         # on each (re)connect.
         async with asyncio.TaskGroup() as tg:
             tg.create_task(manager.connect_websocket())
             tg.create_task(manager.monitor_workers())
+            tg.create_task(handle_stdin(manager))
+            if create_channel_name:
+                tg.create_task(create_on_startup(manager, create_channel_name, create_channel_wd))
     except KeyboardInterrupt:
         pass
     finally:
@@ -1300,8 +1441,23 @@ def main() -> None:
         action="store_true",
         help="Kill all workers on shutdown instead of detaching them",
     )
+    parser.add_argument(
+        "--new",
+        metavar="NAME",
+        help="Create a new channel with the given name on startup",
+    )
+    parser.add_argument(
+        "--working-directory",
+        metavar="DIR",
+        default="",
+        help="Working directory for the new channel (used with --new)",
+    )
     args = parser.parse_args()
-    asyncio.run(run_manager(force_stop=args.stop))
+    asyncio.run(run_manager(
+        force_stop=args.stop,
+        create_channel_name=args.new,
+        create_channel_wd=args.working_directory,
+    ))
 
 
 if __name__ == "__main__":
