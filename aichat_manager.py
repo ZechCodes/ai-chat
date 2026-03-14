@@ -547,10 +547,13 @@ class DeviceManager:
 
         if msg_type == MSG_SEND_MESSAGE:
             content = msg["content"]
+            worker = self.workers.get(channel_id)
+            sender = worker.agent_type if worker else "claude"
             ws_msg = {
                 "type": "send_message",
                 "channel_id": channel_id,
                 "content": content,  # Plaintext fallback
+                "sender": sender,
             }
 
             # E2E: encrypt content if encryption key is available
@@ -572,7 +575,7 @@ class DeviceManager:
             try:
                 await self.local_db.save_message(
                     channel_id=channel_id,
-                    sender="claude",
+                    sender=sender,
                     content=content,
                     message_id=message_id,
                 )
