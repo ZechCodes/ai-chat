@@ -46,7 +46,7 @@ async def get_api_client():
             raise RuntimeError("AICHAT_CHANNEL_ID is required when using AICHAT_IPC_SOCKET")
         from aichat_ipc import IPCClient
 
-        client = IPCClient(IPC_SOCKET, CHANNEL_ID)
+        client = IPCClient(IPC_SOCKET, CHANNEL_ID, role="auxiliary")
         await client.connect()
         _api_client = client
         log.info("Connected to IPC at %s for channel %s", IPC_SOCKET, CHANNEL_ID)

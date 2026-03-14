@@ -44,6 +44,9 @@ MSG_EVENT_MESSAGE = "message"
 MSG_EVENT_PLAN = "plan_event"
 MSG_EVENT_INTERACTION_RESPONSE = "interaction_response"
 
+REGISTER_ROLE_PRIMARY = "primary"
+REGISTER_ROLE_AUX = "auxiliary"
+
 
 def _generate_rid() -> str:
     return uuid.uuid4().hex[:12]
@@ -98,14 +101,23 @@ class IPCServer:
             self._server.close()
             await self._server.wait_closed()
 
-        for writer in self._workers.values():
-            writer.close()
+        all_writers: list[asyncio.StreamWriter] = list(self._workers.values())
         self._workers.clear()
 
         for writers in self._aux_connections.values():
-            for writer in writers:
-                writer.close()
+            all_writers.extend(writers)
         self._aux_connections.clear()
+
+        for writer in all_writers:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        for writer in all_writers:
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
         if os.path.exists(self.socket_path):
             os.unlink(self.socket_path)
@@ -120,7 +132,8 @@ class IPCServer:
             return True
         except (ConnectionError, OSError) as e:
             log.warning("Failed to send to worker %s: %s", channel_id, e)
-            self._workers.pop(channel_id, None)
+            if self._workers.get(channel_id) is writer:
+                self._workers.pop(channel_id, None)
             return False
 
     async def broadcast_to_workers(self, message: dict) -> None:
@@ -137,16 +150,38 @@ class IPCServer:
         try:
             async for msg in _read_messages(reader):
                 if msg.get("type") == MSG_REGISTER:
-                    channel_id = msg["channel_id"]
-                    if channel_id not in self._workers:
-                        # First connection for this channel — primary worker
+                    candidate_channel_id = msg.get("channel_id")
+                    if not candidate_channel_id or not isinstance(candidate_channel_id, str):
+                        log.warning("IPC: register missing/invalid channel_id, ignoring")
+                        continue
+
+                    channel_id = candidate_channel_id
+                    role = msg.get("role") or REGISTER_ROLE_PRIMARY
+
+                    if role == REGISTER_ROLE_PRIMARY:
+                        # Always use the latest primary registration. This prevents
+                        # stale primary sockets from stranding healthy reconnects.
+                        old_primary = self._workers.get(channel_id)
+                        if old_primary and old_primary is not writer:
+                            log.warning(
+                                "IPC: replacing stale primary connection for channel %s",
+                                channel_id,
+                            )
+                            try:
+                                old_primary.close()
+                            except Exception:
+                                pass
                         self._workers[channel_id] = writer
                         is_primary = True
-                        log.info("IPC: worker registered for channel %s", channel_id)
+                        aux_list = self._aux_connections.get(channel_id, [])
+                        if writer in aux_list:
+                            aux_list.remove(writer)
+                        log.info("IPC: primary worker registered for channel %s", channel_id)
                     else:
                         # Additional connection (e.g. MCP server subprocess)
+                        is_primary = False
                         self._aux_connections.setdefault(channel_id, []).append(writer)
-                        log.info("IPC: auxiliary connection registered for channel %s", channel_id)
+                        log.info("IPC: auxiliary connection (%s) registered for channel %s", role, channel_id)
                     continue
 
                 if not channel_id:
@@ -181,14 +216,21 @@ class IPCServer:
         finally:
             if channel_id:
                 if is_primary:
-                    self._workers.pop(channel_id, None)
-                    log.info("IPC: worker disconnected for channel %s", channel_id)
+                    if self._workers.get(channel_id) is writer:
+                        self._workers.pop(channel_id, None)
+                    log.info("IPC: primary worker disconnected for channel %s", channel_id)
                 else:
                     aux_list = self._aux_connections.get(channel_id, [])
                     if writer in aux_list:
                         aux_list.remove(writer)
+                    if not aux_list and channel_id in self._aux_connections:
+                        self._aux_connections.pop(channel_id, None)
                     log.info("IPC: auxiliary connection disconnected for channel %s", channel_id)
             writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -202,9 +244,16 @@ class IPCClient:
     Also receives pushed events from the manager.
     """
 
-    def __init__(self, socket_path: str, channel_id: str):
+    def __init__(
+        self,
+        socket_path: str,
+        channel_id: str,
+        *,
+        role: str = REGISTER_ROLE_PRIMARY,
+    ):
         self.socket_path = socket_path
         self.channel_id = channel_id
+        self.role = role
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._pending: dict[str, asyncio.Future] = {}  # rid -> Future
@@ -221,9 +270,10 @@ class IPCClient:
         await _write_message(self._writer, {
             "type": MSG_REGISTER,
             "channel_id": self.channel_id,
+            "role": self.role,
         })
         self._listen_task = asyncio.create_task(self._listen())
-        log.info("IPC: connected to manager, registered channel %s", self.channel_id)
+        log.info("IPC: connected to manager, registered channel %s as %s", self.channel_id, self.role)
 
     async def close(self) -> None:
         """Close the connection."""
@@ -235,6 +285,12 @@ class IPCClient:
                 pass
         if self._writer:
             self._writer.close()
+            try:
+                await self._writer.wait_closed()
+            except Exception:
+                pass
+        self._reader = None
+        self._writer = None
 
     async def _listen(self) -> None:
         """Background task: read messages from manager, dispatch responses and events."""
@@ -271,18 +327,29 @@ class IPCClient:
 
     async def _request(self, msg: dict, timeout: float = 30.0) -> dict:
         """Send a request and await the response."""
+        if not self._writer or self._writer.is_closing():
+            raise ConnectionError("IPC client not connected")
+
         rid = _generate_rid()
         msg["rid"] = rid
 
-        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[rid] = future
 
         try:
             await _write_message(self._writer, msg)
+        except Exception as e:
+            self._pending.pop(rid, None)
+            raise ConnectionError(f"IPC request send failed: {e}") from e
+
+        try:
             result = await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
             self._pending.pop(rid, None)
             raise TimeoutError(f"IPC request timed out after {timeout}s: {msg.get('type')}")
+        except asyncio.CancelledError:
+            self._pending.pop(rid, None)
+            raise
 
         if not result.get("ok"):
             raise RuntimeError(f"IPC request failed: {result.get('error', 'unknown')}")
@@ -290,7 +357,12 @@ class IPCClient:
 
     async def _fire_and_forget(self, msg: dict) -> None:
         """Send a message without waiting for a response."""
-        await _write_message(self._writer, msg)
+        if not self._writer or self._writer.is_closing():
+            raise ConnectionError("IPC client not connected")
+        try:
+            await _write_message(self._writer, msg)
+        except Exception as e:
+            raise ConnectionError(f"IPC send failed: {e}") from e
 
     # -----------------------------------------------------------------------
     # AiChatAPI-compatible interface
