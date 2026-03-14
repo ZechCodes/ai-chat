@@ -193,6 +193,79 @@ class DeviceManager:
         self._ws_pending: dict[str, asyncio.Future] = {}  # rid → Future
         self._ws_lock = asyncio.Lock()  # serialize sends
 
+    def _build_encrypted_message_payload(
+        self,
+        channel_id: str,
+        content: str,
+        attachments: list | None,
+        *,
+        message_id: str = "",
+    ) -> str:
+        """Build versioned encrypted message payload with channel/message binding."""
+        payload: dict = {
+            "schema": "aichat-e2e-v1",
+            "meta": {
+                "channel_id": channel_id,
+            },
+            "content": content,
+            "attachments": attachments or [],
+        }
+        if message_id:
+            payload["meta"]["message_id"] = message_id
+        return json.dumps(payload)
+
+    def _parse_encrypted_message_payload(
+        self,
+        plaintext: str,
+        *,
+        expected_channel_id: str,
+        expected_message_id: str = "",
+    ) -> tuple[str, list]:
+        """Parse decrypted message payload and verify metadata when present.
+
+        For backward compatibility, legacy payloads without schema/meta are accepted.
+        """
+        try:
+            payload = json.loads(plaintext)
+        except (json.JSONDecodeError, TypeError):
+            return plaintext, []
+
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid encrypted message payload shape")
+
+        content = payload.get("content", "")
+        attachments = payload.get("attachments") or []
+        if not isinstance(content, str):
+            raise ValueError("Invalid encrypted payload content type")
+        if not isinstance(attachments, list):
+            raise ValueError("Invalid encrypted payload attachments type")
+
+        schema = payload.get("schema")
+        meta = payload.get("meta")
+        if schema == "aichat-e2e-v1":
+            if not isinstance(meta, dict):
+                raise ValueError("Missing encrypted payload metadata")
+            payload_channel_id = meta.get("channel_id")
+            if payload_channel_id != expected_channel_id:
+                raise ValueError(
+                    f"Encrypted payload channel mismatch: expected {expected_channel_id}, got {payload_channel_id}"
+                )
+            if expected_message_id:
+                payload_message_id = meta.get("message_id")
+                if payload_message_id and payload_message_id != expected_message_id:
+                    raise ValueError(
+                        f"Encrypted payload message mismatch: expected {expected_message_id}, got {payload_message_id}"
+                    )
+        elif isinstance(meta, dict):
+            # Legacy payload with optional metadata: validate if present.
+            payload_channel_id = meta.get("channel_id")
+            if payload_channel_id and payload_channel_id != expected_channel_id:
+                raise ValueError(
+                    f"Encrypted payload channel mismatch: expected {expected_channel_id}, got {payload_channel_id}"
+                )
+
+        return content, attachments
+
     # ------------------------------------------------------------------
     # WebSocket communication
     # ------------------------------------------------------------------
@@ -430,10 +503,12 @@ class DeviceManager:
                     "read_by_user_at": msg.get("read_by_user_at"),
                     "read_by_claude_at": msg.get("read_by_claude_at"),
                 }
-                payload = json.dumps({
-                    "content": msg["content"],
-                    "attachments": json.loads(msg["attachments"]) if msg.get("attachments") else None,
-                })
+                payload = self._build_encrypted_message_payload(
+                    channel_id=channel_id,
+                    content=msg["content"],
+                    attachments=json.loads(msg["attachments"]) if msg.get("attachments") else [],
+                    message_id=msg["id"],
+                )
                 if self.encryption_key_b64:
                     ct, nonce = crypto_encrypt(self.encryption_key_b64, payload)
                     msg_data["encrypted_payload"] = ct
@@ -490,7 +565,11 @@ class DeviceManager:
                     message_id or "<unknown>",
                 )
                 return
-            payload = json.loads(plain)
+            content, attachments = self._parse_encrypted_message_payload(
+                plain,
+                expected_channel_id=channel_id,
+                expected_message_id=message_id,
+            )
         except Exception as e:
             log.warning(
                 "Failed to decrypt user content relay "
@@ -500,9 +579,6 @@ class DeviceManager:
                 e,
             )
             return
-
-        content = payload.get("content", "")
-        attachments: list = payload.get("attachments") or []
 
         # Store plaintext locally
         try:
@@ -548,18 +624,21 @@ class DeviceManager:
                         plaintext = crypto_decrypt(
                             self.encryption_key_b64, event["encrypted_payload"], event["nonce"]
                         )
-                    except Exception:
-                        plaintext = None
-                    if plaintext:
-                        try:
-                            payload = json.loads(plaintext)
-                            content = payload.get("content", content)
-                            attachments = payload.get("attachments", attachments)
-                        except (json.JSONDecodeError, TypeError):
-                            content = plaintext
-                        # Patch event for worker forwarding
-                        event["content"] = content
-                        event["attachments"] = attachments
+                    except Exception as e:
+                        log.warning("Failed to decrypt encrypted user payload: %s", e)
+                        return
+                    try:
+                        content, attachments = self._parse_encrypted_message_payload(
+                            plaintext,
+                            expected_channel_id=event.get("channel_id", ""),
+                            expected_message_id=event.get("message_id", ""),
+                        )
+                    except Exception as e:
+                        log.warning("Invalid encrypted user payload metadata: %s", e)
+                        return
+                    # Patch event for worker forwarding
+                    event["content"] = content
+                    event["attachments"] = attachments
 
                 await self.local_db.save_message(
                     channel_id=event["channel_id"],
@@ -599,6 +678,7 @@ class DeviceManager:
             content = msg["content"]
             worker = self.workers.get(channel_id)
             sender = worker.agent_type if worker else "claude"
+            attachments = msg.get("attachments")
             ws_msg = {
                 "type": "send_message",
                 "channel_id": channel_id,
@@ -607,11 +687,14 @@ class DeviceManager:
             }
 
             # E2E: encrypt content if encryption key is available
-            attachments = msg.get("attachments")
-            encrypted = crypto_encrypt(
-                self.encryption_key_b64,
-                json.dumps({"content": content, "attachments": attachments or []})
-            ) if self.encryption_key_b64 else None
+            encrypted = None
+            if self.encryption_key_b64:
+                encrypted_payload = self._build_encrypted_message_payload(
+                    channel_id=channel_id,
+                    content=content,
+                    attachments=attachments or [],
+                )
+                encrypted = crypto_encrypt(self.encryption_key_b64, encrypted_payload)
             if encrypted:
                 ct, nonce = encrypted
                 ws_msg["encrypted_payload"] = ct
@@ -634,7 +717,17 @@ class DeviceManager:
 
             # E2E: send encrypted content via ephemeral relay (separate from notification)
             if encrypted:
-                ct, nonce = encrypted
+                # Bind relay payload to the final server message_id when available.
+                relay_encrypted = encrypted
+                if self.encryption_key_b64 and message_id:
+                    relay_payload = self._build_encrypted_message_payload(
+                        channel_id=channel_id,
+                        content=content,
+                        attachments=attachments or [],
+                        message_id=message_id,
+                    )
+                    relay_encrypted = crypto_encrypt(self.encryption_key_b64, relay_payload)
+                ct, nonce = relay_encrypted
                 await self._ws_fire_and_forget({
                     "type": "relay_content",
                     "channel_id": channel_id,

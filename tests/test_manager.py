@@ -1,6 +1,7 @@
 """Tests for the device manager."""
 
 import base64
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -331,6 +332,16 @@ class TestDeviceManager:
                 manager._kill_stale_pid("ch-1", 1234)
         assert mock_kill.call_count == 1  # liveness check only
 
+    def test_parse_encrypted_message_payload_rejects_channel_mismatch(self, manager):
+        payload = json.dumps({
+            "schema": "aichat-e2e-v1",
+            "meta": {"channel_id": "ch-2"},
+            "content": "hello",
+            "attachments": [],
+        })
+        with pytest.raises(ValueError):
+            manager._parse_encrypted_message_payload(payload, expected_channel_id="ch-1")
+
     def test_format_adoption_report_empty(self, manager):
         lines = manager.format_adoption_report()
         assert lines == ["Saved PID adoption report: no saved PID actions recorded yet."]
@@ -405,3 +416,47 @@ class TestDeviceManager:
                     })
         mock_save.assert_not_called()
         mock_forward.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handle_user_content_relay_drops_on_metadata_mismatch(self, manager):
+        manager.ipc = MagicMock()
+        manager.encryption_key_b64 = "fake-key"
+        plain = json.dumps({
+            "schema": "aichat-e2e-v1",
+            "meta": {"channel_id": "ch-other", "message_id": "m-1"},
+            "content": "hello",
+            "attachments": [],
+        })
+        with patch("aichat_manager.crypto_decrypt", return_value=plain):
+            with patch.object(manager.local_db, "save_message", AsyncMock()) as mock_save:
+                with patch.object(manager, "_forward_event_to_worker", AsyncMock()) as mock_forward:
+                    await manager._handle_user_content_relay({
+                        "event_type": "aichat:user-content",
+                        "channel_id": "ch-1",
+                        "message_id": "m-1",
+                        "encrypted_payload": "abc",
+                        "nonce": "def",
+                    })
+        mock_save.assert_not_called()
+        mock_forward.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_store_event_locally_drops_invalid_encrypted_payload(self, manager):
+        manager.encryption_key_b64 = "fake-key"
+        plain = json.dumps({
+            "schema": "aichat-e2e-v1",
+            "meta": {"channel_id": "ch-other"},
+            "content": "hello",
+            "attachments": [],
+        })
+        with patch("aichat_manager.crypto_decrypt", return_value=plain):
+            with patch.object(manager.local_db, "save_message", AsyncMock()) as mock_save:
+                await manager._store_event_locally({
+                    "event_type": "aichat:message",
+                    "sender": "user",
+                    "channel_id": "ch-1",
+                    "message_id": "m-1",
+                    "encrypted_payload": "abc",
+                    "nonce": "def",
+                })
+        mock_save.assert_not_called()

@@ -12,6 +12,7 @@ Crypto stack:
 from __future__ import annotations
 
 import base64
+import binascii
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
@@ -26,6 +27,23 @@ import nacl.utils
 # Salt for HKDF derivation
 _HKDF_SALT = b"aichat-device-key"
 _HKDF_INFO = b"v1"
+
+
+def _b64decode_strict(value: str, *, field: str) -> bytes:
+    """Strict base64 decode with clear error context."""
+    try:
+        return base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError, TypeError) as e:
+        raise ValueError(f"Invalid base64 for {field}") from e
+
+
+def _decode_secretbox_key(key_b64: str) -> bytes:
+    key = _b64decode_strict(key_b64, field="key")
+    if len(key) != nacl.secret.SecretBox.KEY_SIZE:
+        raise ValueError(
+            f"Invalid key length: expected {nacl.secret.SecretBox.KEY_SIZE} bytes, got {len(key)}"
+        )
+    return key
 
 
 # ------------------------------------------------------------------
@@ -65,7 +83,7 @@ def encrypt(key_b64: str, plaintext: str) -> tuple[str, str]:
     Returns:
         (ciphertext_b64, nonce_b64) tuple, both base64-encoded.
     """
-    key = base64.b64decode(key_b64)
+    key = _decode_secretbox_key(key_b64)
     box = nacl.secret.SecretBox(key)
     nonce = nacl.utils.random(nacl.secret.SecretBox.NONCE_SIZE)
     encrypted = box.encrypt(plaintext.encode("utf-8"), nonce)
@@ -88,10 +106,18 @@ def decrypt(key_b64: str, ciphertext_b64: str, nonce_b64: str) -> str:
     Returns:
         Decrypted UTF-8 string.
     """
-    key = base64.b64decode(key_b64)
+    key = _decode_secretbox_key(key_b64)
     box = nacl.secret.SecretBox(key)
-    ciphertext = base64.b64decode(ciphertext_b64)
-    nonce = base64.b64decode(nonce_b64)
+    ciphertext = _b64decode_strict(ciphertext_b64, field="ciphertext")
+    nonce = _b64decode_strict(nonce_b64, field="nonce")
+    if len(nonce) != nacl.secret.SecretBox.NONCE_SIZE:
+        raise ValueError(
+            f"Invalid nonce length: expected {nacl.secret.SecretBox.NONCE_SIZE} bytes, got {len(nonce)}"
+        )
+    if len(ciphertext) < nacl.secret.SecretBox.MACBYTES:
+        raise ValueError(
+            f"Invalid ciphertext length: expected at least {nacl.secret.SecretBox.MACBYTES} bytes, got {len(ciphertext)}"
+        )
     plaintext = box.decrypt(ciphertext, nonce)
     return plaintext.decode("utf-8")
 
@@ -105,11 +131,18 @@ def _compute_shared_secret(
     our_private_b64: str, their_public_b64: str
 ) -> bytes:
     """Compute the raw X25519 shared secret from our private key and their public key."""
+    private_key_raw = _b64decode_strict(our_private_b64, field="x25519 private key")
+    public_key_raw = _b64decode_strict(their_public_b64, field="x25519 public key")
+    if len(private_key_raw) != 32:
+        raise ValueError(f"Invalid x25519 private key length: expected 32 bytes, got {len(private_key_raw)}")
+    if len(public_key_raw) != 32:
+        raise ValueError(f"Invalid x25519 public key length: expected 32 bytes, got {len(public_key_raw)}")
+
     private_key = X25519PrivateKey.from_private_bytes(
-        base64.b64decode(our_private_b64)
+        private_key_raw
     )
     public_key = X25519PublicKey.from_public_bytes(
-        base64.b64decode(their_public_b64)
+        public_key_raw
     )
     return private_key.exchange(public_key)
 
@@ -155,7 +188,9 @@ class KeyExchange:
     def restore_key(self, key_b64: str) -> None:
         """Load a previously derived key from persistent storage."""
         if key_b64:
-            self._key_b64 = key_b64
+            # Validate persisted key before marking exchange ready.
+            key = _decode_secretbox_key(key_b64)
+            self._key_b64 = base64.b64encode(key).decode()
 
     def complete_exchange(self, their_public_b64: str) -> str:
         """Complete the ECDH exchange with the other party's public key.
@@ -175,10 +210,11 @@ class KeyExchange:
         return encrypt(self._key_b64, plaintext)
 
     def decrypt(self, ciphertext_b64: str, nonce_b64: str) -> str | None:
-        """Decrypt ciphertext. Returns plaintext or None if not ready."""
+        """Decrypt ciphertext.
+
+        Returns plaintext, or None if not ready. Raises if ciphertext/nonce
+        is invalid or authentication fails.
+        """
         if not self._key_b64:
             return None
-        try:
-            return decrypt(self._key_b64, ciphertext_b64, nonce_b64)
-        except Exception:
-            return None
+        return decrypt(self._key_b64, ciphertext_b64, nonce_b64)

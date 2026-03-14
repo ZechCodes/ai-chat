@@ -5,6 +5,9 @@ from __future__ import annotations
 import base64
 import os
 
+import nacl.exceptions
+import pytest
+
 from aichat_crypto import (
     KeyExchange,
     decrypt,
@@ -50,11 +53,8 @@ def test_decrypt_with_wrong_key_fails():
 
     ct, nonce = encrypt(key1, plaintext)
 
-    try:
+    with pytest.raises(nacl.exceptions.CryptoError):
         decrypt(key2, ct, nonce)
-        assert False, "Should have raised"
-    except Exception:
-        pass  # Expected: CryptoError
 
 
 def test_encrypt_decrypt_unicode():
@@ -155,6 +155,47 @@ def test_restore_key():
     assert encrypted is not None
     ct, nonce = encrypted
     assert kx1.decrypt(ct, nonce) == "test message"
+
+
+def test_restore_key_rejects_invalid_key():
+    kp = generate_x25519_keypair()
+    kx = KeyExchange(kp["private_key_b64"], kp["public_key_b64"])
+
+    with pytest.raises(ValueError):
+        kx.restore_key("not-base64")
+    assert not kx.is_ready
+
+
+def test_encrypt_rejects_non_strict_base64_key():
+    key_with_junk = "YWJj***"  # decodes in permissive mode, should fail in strict mode
+    with pytest.raises(ValueError):
+        encrypt(key_with_junk, "hello")
+
+
+def test_decrypt_rejects_invalid_nonce_length():
+    key = base64.b64encode(os.urandom(32)).decode()
+    ct, _ = encrypt(key, "hello")
+    short_nonce = base64.b64encode(b"short").decode()
+    with pytest.raises(ValueError):
+        decrypt(key, ct, short_nonce)
+
+
+def test_keyexchange_decrypt_propagates_auth_failure():
+    device = generate_x25519_keypair()
+    browser = generate_x25519_keypair()
+    device_kx = KeyExchange(device["private_key_b64"], device["public_key_b64"])
+    browser_kx = KeyExchange(browser["private_key_b64"], browser["public_key_b64"])
+
+    device_kx.complete_exchange(browser["public_key_b64"])
+    browser_kx.complete_exchange(device["public_key_b64"])
+
+    encrypted = device_kx.encrypt("hello")
+    assert encrypted is not None
+    ct, nonce = encrypted
+    tampered_ct = ct[:-4] + ("AAAA" if len(ct) >= 4 else ct)
+
+    with pytest.raises((ValueError, nacl.exceptions.CryptoError)):
+        browser_kx.decrypt(tampered_ct, nonce)
 
 
 def test_full_e2e_flow():
