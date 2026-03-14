@@ -393,6 +393,8 @@ async def silence_reminder_task(
         now = time.time()
         last_send = hook_state.get("last_send_time", now)
         last_remind = hook_state.get("last_silence_remind_bg", 0)
+        if not hook_state.get("working"):
+            continue  # Don't nudge when idle
         if now - last_send >= _SILENCE_THRESHOLD and now - last_remind >= _SILENCE_THRESHOLD:
             hook_state["last_silence_remind_bg"] = now
             await message_queue.put({
@@ -491,9 +493,11 @@ async def run_agent(
 
                 # Initial query
                 log.info("Sending initial prompt to agent")
+                hook_state["working"] = True
                 await client.query(prompt)
                 async for message in client.receive_response():
                     await handle_response_message(message, api)
+                hook_state["working"] = False
 
                 # Message loop
                 pending_plan_event = None
@@ -631,9 +635,11 @@ async def run_agent(
                             prompt += "\n\n[System: The user has deactivated planning mode.]"
                         pending_plan_event = None
 
+                    hook_state["working"] = True
                     await client.query(prompt)
                     async for message in client.receive_response():
                         await handle_response_message(message, api)
+                    hook_state["working"] = False
 
             # Client exited — log and loop back for fresh context
             log.info("Agent context reset (%s), starting fresh client", reset_reason)

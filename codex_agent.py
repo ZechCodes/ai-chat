@@ -396,6 +396,8 @@ async def silence_reminder_task(
         now = time.time()
         last_send = hook_state.get("last_send_time", now)
         last_remind = hook_state.get("last_silence_remind_bg", 0)
+        if not hook_state.get("working"):
+            continue  # Don't nudge when idle
         if now - last_send >= _SILENCE_THRESHOLD and now - last_remind >= _SILENCE_THRESHOLD:
             hook_state["last_silence_remind_bg"] = now
             await message_queue.put({
@@ -500,11 +502,13 @@ async def run_agent(
                 nonlocal current_turn_id
                 turn = params.get("turn", {})
                 current_turn_id = turn.get("id")
+                hook_state["working"] = True
                 log.info("Turn started: %s", current_turn_id)
 
             async def on_turn_completed(params):
                 nonlocal current_turn_id
                 current_turn_id = None
+                hook_state["working"] = False
                 await api.send_tool_status("idle")
                 log.info("Turn completed")
 
