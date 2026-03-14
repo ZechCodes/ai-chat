@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import json
 import logging
 import os
@@ -282,6 +283,7 @@ async def listen_sse(
             log.info("SSE session acquired, connecting to notification stream")
             async with httpx.AsyncClient(cookies=cookies, timeout=httpx.Timeout(None, connect=10)) as http:
                 async with http.stream("GET", f"{api.base_url}/notifications/stream") as response:
+                    response.raise_for_status()
                     async for line in response.aiter_lines():
                         event_data = _parse_sse_event(line, api.channel_id)
                         if event_data is None:
@@ -353,13 +355,14 @@ async def listen_ipc(
                 })
 
     ipc_client.on_event(handle_event)
-    # The IPC client's _listen task handles the actual reading.
-    # We just need to keep this coroutine alive so the task group doesn't exit.
+    listen_task = getattr(ipc_client, "_listen_task", None)
+    if not listen_task:
+        raise RuntimeError("IPC listener task not started")
     try:
-        while True:
-            await asyncio.sleep(3600)
+        await listen_task
     except asyncio.CancelledError:
-        pass
+        raise
+    raise ConnectionError("IPC listener stopped")
 
 
 SSE_CONTEXT = (
@@ -417,6 +420,37 @@ def _drain_queue(message_queue: asyncio.Queue) -> list[dict]:
     return items
 
 
+async def _await_next_message_or_listener_failure(
+    message_queue: asyncio.Queue,
+    event_task: asyncio.Task,
+) -> dict:
+    """Wait for either a new message or listener failure."""
+    queue_task = asyncio.create_task(message_queue.get())
+    done, _ = await asyncio.wait({queue_task, event_task}, return_when=asyncio.FIRST_COMPLETED)
+
+    if event_task in done:
+        queue_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await queue_task
+        if event_task.cancelled():
+            raise RuntimeError("Event listener task was cancelled unexpectedly")
+        exc = event_task.exception()
+        if exc:
+            raise RuntimeError("Event listener task failed") from exc
+        raise RuntimeError("Event listener task exited unexpectedly")
+
+    return queue_task.result()
+
+
+async def _send_startup_status(api, hook_state: dict) -> None:
+    """Send startup status without failing agent startup on transient errors."""
+    try:
+        await api.send_tool_status("active", tool="startup", description="Agent online.")
+        hook_state["last_send_time"] = time.time()
+    except Exception as e:
+        log.warning("Failed to send startup tool status: %s", e)
+
+
 async def run_agent(
     initial_prompt: str | None = None,
     token: str | None = None,
@@ -430,6 +464,8 @@ async def run_agent(
 
     # Choose API backend: IPC (via manager) or direct HTTP
     if ipc_socket:
+        if not channel_id:
+            raise ValueError("--channel-id is required when --ipc-socket is provided")
         from aichat_ipc import IPCClient
         api = IPCClient(ipc_socket, channel_id)
         await api.connect()
@@ -462,8 +498,7 @@ async def run_agent(
     except Exception as e:
         log.warning("Failed to report working directory: %s", e)
 
-    await api.send_tool_status("active", tool="startup", description="Agent online.")
-    hook_state["last_send_time"] = time.time()
+    await _send_startup_status(api, hook_state)
     log.info("Agent started, channel=%s, cwd=%s", channel_id or getattr(api, 'channel_id', '?'), cwd)
 
     # Start event listener (IPC or SSE depending on mode)
@@ -506,7 +541,7 @@ async def run_agent(
                     pending = _drain_queue(message_queue)
                     if not pending:
                         # Nothing available — block for the next message
-                        msg_data = await message_queue.get()
+                        msg_data = await _await_next_message_or_listener_failure(message_queue, event_task)
                     elif len(pending) == 1:
                         msg_data = pending[0]
                     else:

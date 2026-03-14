@@ -1,5 +1,6 @@
 """Tests for the agent wrapper."""
 
+import asyncio
 import json
 from unittest.mock import MagicMock
 
@@ -7,8 +8,17 @@ import httpx
 import pytest
 import respx
 
+import aichat_agent
 from aichat_api import AiChatAPI
-from aichat_agent import build_agent_options, handle_response_message
+from aichat_agent import (
+    _await_next_message_or_listener_failure,
+    _send_startup_status,
+    build_agent_options,
+    handle_response_message,
+    listen_ipc,
+    listen_sse,
+    run_agent,
+)
 from aichat_interactions import InteractionManager
 
 
@@ -107,3 +117,69 @@ class TestHandleResponseMessage:
         msg.content = [tool_block]
         await handle_response_message(msg, api)
         assert not route.called
+
+
+class TestListenSSE:
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_non_200_status_uses_http_error_backoff(self, api, interactions, monkeypatch):
+        respx.get("https://test.example.com/notifications/stream").mock(
+            return_value=httpx.Response(401)
+        )
+        async def fake_get_session():
+            return {}
+
+        monkeypatch.setattr(api, "get_session", fake_get_session)
+        sleep_calls = []
+
+        async def fake_sleep(delay):
+            sleep_calls.append(delay)
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(aichat_agent.asyncio, "sleep", fake_sleep)
+        with pytest.raises(asyncio.CancelledError):
+            await listen_sse(asyncio.Queue(), interactions, api)
+        assert sleep_calls == [5]
+
+
+class TestIPCListener:
+    @pytest.mark.asyncio
+    async def test_listen_ipc_raises_on_disconnect(self, interactions):
+        class FakeIPCClient:
+            def __init__(self):
+                self._listen_task = asyncio.get_running_loop().create_future()
+                self.handler = None
+
+            def on_event(self, handler):
+                self.handler = handler
+
+        fake_ipc = FakeIPCClient()
+        fake_ipc._listen_task.set_result(None)
+        with pytest.raises(ConnectionError, match="IPC listener stopped"):
+            await listen_ipc(asyncio.Queue(), interactions, fake_ipc)
+        assert fake_ipc.handler is not None
+
+    @pytest.mark.asyncio
+    async def test_queue_wait_raises_if_event_listener_exits(self):
+        queue: asyncio.Queue[dict] = asyncio.Queue()
+        event_task = asyncio.create_task(asyncio.sleep(0))
+        await event_task
+        with pytest.raises(RuntimeError, match="Event listener task exited unexpectedly"):
+            await _await_next_message_or_listener_failure(queue, event_task)
+
+    @pytest.mark.asyncio
+    async def test_requires_channel_id_when_ipc_socket_provided(self):
+        with pytest.raises(ValueError, match="--channel-id is required"):
+            await run_agent(ipc_socket="/tmp/aichat-test.sock")
+
+
+class TestStartupStatus:
+    @pytest.mark.asyncio
+    async def test_send_startup_status_is_guarded(self):
+        class FakeAPI:
+            async def send_tool_status(self, *_args, **_kwargs):
+                raise RuntimeError("transient failure")
+
+        hook_state = {"last_send_time": 0}
+        await _send_startup_status(FakeAPI(), hook_state)
+        assert hook_state["last_send_time"] == 0
