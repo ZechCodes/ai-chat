@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import platform
+import shlex
 import sys
 import signal
 import time
@@ -44,6 +45,7 @@ from aichat_ipc import (
     MSG_SEND_EVENT,
     MSG_REPORT_DIRECTORIES,
     MSG_DOWNLOAD_ATTACHMENT,
+    MSG_GET_UNREAD,
     MSG_EVENT_MESSAGE,
     MSG_EVENT_PLAN,
     MSG_EVENT_INTERACTION_RESPONSE,
@@ -96,18 +98,21 @@ def parse_device_command(event: dict) -> dict | None:
     if event.get("event_type") != "aichat:device-command":
         return None
     command = event.get("command")
-    if not command:
+    payload = event.get("payload", {})
+    if not command or not isinstance(payload, dict):
         return None
     return {
         "command": command,
-        "payload": event.get("payload", {}),
+        "payload": payload,
     }
 
 
 def _parse_worker_event(event: dict, channel_id: str) -> dict | None:
     """Parse a notification event into an IPC message for a worker, or None if irrelevant."""
-    # Only forward events for this channel
-    if event.get("channel_id") and event.get("channel_id") != channel_id:
+    # Only forward events that explicitly target this channel.
+    # Never broadcast channel-less events to all workers.
+    event_channel_id = event.get("channel_id")
+    if not event_channel_id or event_channel_id != channel_id:
         return None
 
     event_type = event.get("event_type")
@@ -149,6 +154,15 @@ def _parse_worker_event(event: dict, channel_id: str) -> dict | None:
     return None
 
 
+def _parse_create_command_args(args: list[str]) -> tuple[str, str, str]:
+    """Parse args for `new/create` stdin command: <name> [working_directory] [--codex]."""
+    agent_type = "codex" if "--codex" in args else ""
+    cleaned_args = [a for a in args if a != "--codex"]
+    name = cleaned_args[0] if len(cleaned_args) > 0 else ""
+    working_directory = cleaned_args[1] if len(cleaned_args) > 1 else ""
+    return name, working_directory, agent_type
+
+
 class DeviceManager:
     """Manages worker processes on this device."""
 
@@ -164,6 +178,8 @@ class DeviceManager:
         self.default_agent_type = default_agent_type
         self.workers: dict[str, WorkerProcess] = {}
         self.last_event_ts: str | None = None
+        self.last_adoption_report: list[dict[str, str | int]] = []
+        self._sync_done_event = asyncio.Event()
 
         # Local database for messages and channels
         self.local_db = LocalDB()
@@ -234,7 +250,11 @@ class DeviceManager:
 
             if msg_type == "event":
                 log.info("WS event received: event_type=%s", msg.get("event_type"))
-                await self._handle_ws_event(msg)
+                try:
+                    await self._handle_ws_event(msg)
+                except Exception as e:
+                    # Don't tear down the WS loop because of a single bad event payload.
+                    log.warning("Failed to handle WS event: %s", e)
                 continue
 
             log.warning("Unknown WS message type: %s", msg_type)
@@ -451,17 +471,38 @@ class DeviceManager:
         if not channel_id or not encrypted_payload or not nonce:
             return
 
-        content = ""
-        attachments: list = []
-        if self.encryption_key_b64:
-            try:
-                plain = crypto_decrypt(self.encryption_key_b64, encrypted_payload, nonce)
-                if plain:
-                    payload = json.loads(plain)
-                    content = payload.get("content", "")
-                    attachments = payload.get("attachments") or []
-            except Exception as e:
-                log.warning("Failed to decrypt user content relay: %s", e)
+        if not self.encryption_key_b64:
+            log.warning(
+                "Dropping encrypted user content relay without encryption key "
+                "(channel=%s, message_id=%s)",
+                channel_id,
+                message_id or "<unknown>",
+            )
+            return
+
+        try:
+            plain = crypto_decrypt(self.encryption_key_b64, encrypted_payload, nonce)
+            if not plain:
+                log.warning(
+                    "Dropping user content relay with empty plaintext "
+                    "(channel=%s, message_id=%s)",
+                    channel_id,
+                    message_id or "<unknown>",
+                )
+                return
+            payload = json.loads(plain)
+        except Exception as e:
+            log.warning(
+                "Failed to decrypt user content relay "
+                "(channel=%s, message_id=%s): %s",
+                channel_id,
+                message_id or "<unknown>",
+                e,
+            )
+            return
+
+        content = payload.get("content", "")
+        attachments: list = payload.get("attachments") or []
 
         # Store plaintext locally
         try:
@@ -740,6 +781,11 @@ class DeviceManager:
                 log.warning("Failed to update directories in local DB: %s", e)
             return result
 
+        if msg_type == MSG_GET_UNREAD:
+            api = self._get_download_client(channel_id)
+            messages = await api.get_unread_messages()
+            return {"messages": messages}
+
         if msg_type == MSG_DOWNLOAD_ATTACHMENT:
             # Attachment downloads stay as HTTP (binary data not suited for WS JSON)
             api = self._get_download_client(channel_id)
@@ -815,10 +861,71 @@ class DeviceManager:
         """Kill a stale worker process from a previous run."""
         try:
             os.kill(pid, 0)  # Check if alive
+            if not self._is_expected_worker_process(pid, channel_id):
+                log.warning(
+                    "Refusing to kill pid=%s for channel %s; process does not look like "
+                    "an AI.CHAT worker for this channel",
+                    pid,
+                    channel_id,
+                )
+                return
             log.info("Killing stale worker for channel %s (pid=%s)", channel_id, pid)
             os.kill(pid, 15)  # SIGTERM
         except OSError:
             pass  # Already dead
+
+    def _get_process_cmdline(self, pid: int) -> list[str] | None:
+        """Best-effort read of process command line as argv list."""
+        try:
+            proc_cmdline = f"/proc/{pid}/cmdline"
+            if os.path.exists(proc_cmdline):
+                with open(proc_cmdline, "rb") as f:
+                    raw = f.read()
+                parts = [p.decode(errors="replace") for p in raw.split(b"\0") if p]
+                return parts or None
+        except Exception:
+            pass
+
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["ps", "-o", "command=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if result.returncode != 0:
+                return None
+            line = result.stdout.strip()
+            if not line:
+                return None
+            return shlex.split(line)
+        except Exception:
+            return None
+
+    def _is_expected_worker_process(self, pid: int, channel_id: str) -> bool:
+        """Validate pid belongs to an expected worker process for the channel."""
+        argv = self._get_process_cmdline(pid)
+        if not argv:
+            return False
+
+        joined = " ".join(argv)
+        if "aichat_agent.py" not in joined and "codex_agent.py" not in joined:
+            return False
+
+        channel_match = False
+        socket_match = False
+        for i, token in enumerate(argv):
+            if token == "--channel-id":
+                channel_match = i + 1 < len(argv) and argv[i + 1] == channel_id
+                if not channel_match:
+                    return False
+            if token == "--ipc-socket":
+                socket_match = i + 1 < len(argv) and argv[i + 1] == self.ipc_socket_path
+                if not socket_match:
+                    return False
+        return channel_match and socket_match
 
     async def start_worker(
         self, channel_id: str, channel_token: str = "", working_directory: str = "",
@@ -989,16 +1096,27 @@ class DeviceManager:
         payload = cmd.get("payload", {})
 
         if command == "worker:start":
+            channel_id = payload.get("channel_id")
+            if not channel_id:
+                log.warning("Ignoring worker:start with missing channel_id")
+                return
             await self.start_worker(
-                payload["channel_id"],
+                channel_id,
                 payload.get("channel_token", ""),
                 payload.get("working_directory", ""),
                 agent_type=payload.get("agent_type", ""),
             )
         elif command == "worker:stop":
-            await self.stop_worker(payload["channel_id"])
+            channel_id = payload.get("channel_id")
+            if not channel_id:
+                log.warning("Ignoring worker:stop with missing channel_id")
+                return
+            await self.stop_worker(channel_id)
         elif command == "worker:restart":
-            channel_id = payload["channel_id"]
+            channel_id = payload.get("channel_id")
+            if not channel_id:
+                log.warning("Ignoring worker:restart with missing channel_id")
+                return
             token = self.workers.get(channel_id, None)
             channel_token = token.channel_token if token else payload.get("channel_token", "")
             working_directory = payload.get("working_directory", "")
@@ -1074,6 +1192,7 @@ class DeviceManager:
             return
 
         server_channels = {ch["id"]: ch for ch in data.get("channels", [])}
+        adoption_report: list[dict[str, str | int]] = []
 
         # Sync channel metadata to local DB
         for ch_id, ch_info in server_channels.items():
@@ -1098,7 +1217,31 @@ class DeviceManager:
             if channel_id not in server_channel_ids:
                 pid = info.get("pid")
                 if pid:
-                    self._kill_stale_pid(channel_id, pid)
+                    try:
+                        os.kill(pid, 0)
+                    except OSError:
+                        adoption_report.append({
+                            "channel_id": channel_id,
+                            "pid": pid,
+                            "result": "skipped",
+                            "reason": "saved pid was not running",
+                        })
+                        continue
+                    if self._is_expected_worker_process(pid, channel_id):
+                        self._kill_stale_pid(channel_id, pid)
+                        adoption_report.append({
+                            "channel_id": channel_id,
+                            "pid": pid,
+                            "result": "terminated",
+                            "reason": "channel no longer assigned to this device",
+                        })
+                    else:
+                        adoption_report.append({
+                            "channel_id": channel_id,
+                            "pid": pid,
+                            "result": "skipped",
+                            "reason": "pid did not match expected worker identity",
+                        })
 
         # Stop live workers for channels no longer assigned
         for channel_id in local_channel_ids - server_channel_ids:
@@ -1108,7 +1251,11 @@ class DeviceManager:
         # Start workers for channels not yet running (adopt live PIDs from previous run)
         for channel_id in server_channel_ids - local_channel_ids:
             # Resolve agent_type: local DB (authoritative) > device.json > default
-            local_channel = await self.local_db.get_channel(channel_id)
+            try:
+                local_channel = await self.local_db.get_channel(channel_id)
+            except Exception as e:
+                log.warning("Failed to load local channel metadata for %s: %s", channel_id, e)
+                local_channel = None
             db_agent_type = (local_channel or {}).get("agent_type", "")
             pid_agent_type = saved_pids.get(channel_id, {}).get("agent_type", "")
             resolved_agent_type = db_agent_type or pid_agent_type or ""
@@ -1118,6 +1265,20 @@ class DeviceManager:
                 if pid:
                     try:
                         os.kill(pid, 0)  # Check if alive
+                        if not self._is_expected_worker_process(pid, channel_id):
+                            log.warning(
+                                "Not adopting pid=%s for channel %s; process does not match "
+                                "expected worker identity",
+                                pid,
+                                channel_id,
+                            )
+                            adoption_report.append({
+                                "channel_id": channel_id,
+                                "pid": pid,
+                                "result": "skipped",
+                                "reason": "pid was alive but identity check failed; starting new worker",
+                            })
+                            raise OSError("unexpected process identity")
                         saved_wd = saved_pids[channel_id].get("working_directory", "")
                         saved_started = saved_pids[channel_id].get("started_at", 0.0)
                         log.info("Adopting live worker for channel %s (pid=%s, agent=%s)", channel_id, pid, resolved_agent_type or self.default_agent_type)
@@ -1131,13 +1292,58 @@ class DeviceManager:
                             adopted_pid=pid,
                             agent_type=resolved_agent_type or self.default_agent_type,
                         )
+                        adoption_report.append({
+                            "channel_id": channel_id,
+                            "pid": pid,
+                            "result": "adopted",
+                            "reason": "saved pid was healthy and matched worker identity",
+                        })
                         continue
                     except OSError:
-                        pass  # Dead, start a new one
+                        if not any(
+                            row.get("channel_id") == channel_id and row.get("pid") == pid
+                            for row in adoption_report
+                        ):
+                            adoption_report.append({
+                                "channel_id": channel_id,
+                                "pid": pid,
+                                "result": "skipped",
+                                "reason": "saved pid was not running; starting new worker",
+                            })
+            else:
+                adoption_report.append({
+                    "channel_id": channel_id,
+                    "pid": 0,
+                    "result": "skipped",
+                    "reason": "no saved pid; starting new worker",
+                })
             ch_info = server_channels[channel_id]
             working_directory = ch_info.get("working_directory", "")
             log.info("Channel %s assigned to device, starting worker (cwd=%s, agent=%s)", channel_id, working_directory or "<default>", resolved_agent_type or self.default_agent_type)
             await self.start_worker(channel_id, working_directory=working_directory, agent_type=resolved_agent_type)
+
+        self.last_adoption_report = adoption_report
+        self._sync_done_event.set()
+
+    def format_adoption_report(self) -> list[str]:
+        """Format the latest saved-PID adoption decisions for terminal output."""
+        if not self.last_adoption_report:
+            return ["Saved PID adoption report: no saved PID actions recorded yet."]
+
+        lines = ["Saved PID adoption report:"]
+        for row in self.last_adoption_report:
+            channel_id = str(row.get("channel_id", ""))
+            pid = row.get("pid")
+            pid_part = f"pid={pid}" if pid else "pid=<none>"
+            result = str(row.get("result", "unknown")).upper()
+            reason = str(row.get("reason", ""))
+            lines.append(f"  {channel_id}  {pid_part}  {result}  {reason}")
+        return lines
+
+    def print_adoption_report(self) -> None:
+        """Print the latest saved-PID adoption decisions."""
+        for line in self.format_adoption_report():
+            print(line)
 
     async def report_status(self) -> None:
         """Report device status to the server via WebSocket."""
@@ -1267,6 +1473,7 @@ async def run_manager(
     create_channel_name: str | None = None,
     create_channel_wd: str = "",
     default_agent_type: str = "claude",
+    adoption_check: bool = False,
 ) -> None:
     """Main manager entry point."""
     from aichat_crypto import KeyExchange, generate_x25519_keypair
@@ -1330,14 +1537,19 @@ async def run_manager(
                 line = line_bytes.decode().strip()
                 if not line:
                     continue
-                parts = line.split(None, 2)
+                try:
+                    parts = shlex.split(line)
+                except ValueError as e:
+                    print(f"Parse error: {e}")
+                    continue
+                if not parts:
+                    continue
                 cmd = parts[0].lower()
                 if cmd in ("new", "create"):
-                    name = parts[1] if len(parts) > 1 else ""
-                    wd = parts[2] if len(parts) > 2 else ""
-                    # Check for --codex flag in remaining args
-                    at = "codex" if any(p == "--codex" for p in parts) else ""
-                    wd = wd if wd != "--codex" else ""
+                    name, wd, at = _parse_create_command_args(parts[1:])
+                    if not name:
+                        print("Usage: new <name> [working_directory] [--codex]")
+                        continue
                     await mgr.create_channel(name, wd, agent_type=at)
                 elif cmd == "rename":
                     name = " ".join(parts[1:]) if len(parts) > 1 else ""
@@ -1361,12 +1573,15 @@ async def run_manager(
                         print(f"  {w['channel_id']}  {w['status']}  uptime={w['uptime']}s{mem}")
                     if not status["workers"]:
                         print("  No workers running")
+                elif cmd in ("adoption-check", "adopt", "adoption"):
+                    mgr.print_adoption_report()
                 elif cmd in ("help", "?"):
                     print("Commands:")
                     print("  new <name> [working_directory] [--codex]  — create a channel and start a worker")
                     print("  rename <name>                   — rename this device")
                     print("  delete confirm                  — delete this device and exit")
                     print("  status                          — show worker status")
+                    print("  adoption-check                  — show saved PID adoption/skip decisions")
                     print("  help                            — show this help")
                 else:
                     print(f"Unknown command: {cmd}  (try 'help')")
@@ -1382,6 +1597,11 @@ async def run_manager(
         await asyncio.sleep(1)
         await mgr.create_channel(name, wd)
 
+    async def print_adoption_check_on_startup(mgr: DeviceManager) -> None:
+        """Print saved PID adoption decisions after first channel sync."""
+        await mgr._sync_done_event.wait()
+        mgr.print_adoption_report()
+
     try:
         # WebSocket connection loop, worker monitor, and stdin handler run concurrently.
         # connect_websocket handles initial sync (report_status + sync_channels)
@@ -1390,6 +1610,8 @@ async def run_manager(
             tg.create_task(manager.connect_websocket())
             tg.create_task(manager.monitor_workers())
             tg.create_task(handle_stdin(manager))
+            if adoption_check:
+                tg.create_task(print_adoption_check_on_startup(manager))
             if create_channel_name:
                 tg.create_task(create_on_startup(manager, create_channel_name, create_channel_wd))
     except KeyboardInterrupt:
@@ -1424,12 +1646,18 @@ def main() -> None:
         default="claude",
         help="Default agent type for workers (default: claude)",
     )
+    parser.add_argument(
+        "--adoption-check",
+        action="store_true",
+        help="Print saved PID adoption/skip decisions after initial sync",
+    )
     args = parser.parse_args()
     asyncio.run(run_manager(
         force_stop=args.stop,
         create_channel_name=args.new,
         create_channel_wd=args.working_directory,
         default_agent_type=args.agent_type,
+        adoption_check=args.adoption_check,
     ))
 
 

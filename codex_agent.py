@@ -248,20 +248,40 @@ def _parse_slash_command(content: str) -> str | None:
 # MCP config generation
 # ---------------------------------------------------------------------------
 
-def _build_mcp_config_overrides(ipc_socket: str, channel_id: str) -> list[str]:
+def _build_mcp_config_overrides(
+    channel_id: str,
+    *,
+    ipc_socket: str | None = None,
+    base_url: str | None = None,
+    token: str | None = None,
+    device_key: str | None = None,
+    device_id: str | None = None,
+) -> list[str]:
     """Build -c flag overrides for codex app-server to configure our MCP server.
 
     Uses -c flags so Codex keeps its normal CODEX_HOME (and auth tokens).
     """
     mcp_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aichat_mcp_server.py")
 
-    return [
+    overrides = [
         'mcp_servers.aichat.type="stdio"',
         'mcp_servers.aichat.command="uv"',
-        f'mcp_servers.aichat.args=["run", "python3", "{mcp_script}"]',
-        f'mcp_servers.aichat.env.AICHAT_IPC_SOCKET="{ipc_socket}"',
-        f'mcp_servers.aichat.env.AICHAT_CHANNEL_ID="{channel_id}"',
+        f"mcp_servers.aichat.args={json.dumps(['run', 'python3', mcp_script])}",
+        f"mcp_servers.aichat.env.AICHAT_CHANNEL_ID={json.dumps(channel_id)}",
     ]
+
+    if ipc_socket:
+        overrides.append(f"mcp_servers.aichat.env.AICHAT_IPC_SOCKET={json.dumps(ipc_socket)}")
+    if base_url:
+        overrides.append(f"mcp_servers.aichat.env.AICHAT_BASE_URL={json.dumps(base_url)}")
+    if token:
+        overrides.append(f"mcp_servers.aichat.env.AICHAT_TOKEN={json.dumps(token)}")
+    if device_key:
+        overrides.append(f"mcp_servers.aichat.env.AICHAT_DEVICE_KEY={json.dumps(device_key)}")
+    if device_id:
+        overrides.append(f"mcp_servers.aichat.env.AICHAT_DEVICE_ID={json.dumps(device_id)}")
+
+    return overrides
 
 
 # ---------------------------------------------------------------------------
@@ -479,8 +499,18 @@ async def run_agent(
 
     # Build MCP config overrides for codex app-server
     config_overrides: list[str] = []
-    if channel_id:
-        config_overrides = _build_mcp_config_overrides(ipc_socket or "", channel_id)
+    effective_channel_id = channel_id or getattr(api, "channel_id", None)
+    if effective_channel_id:
+        config_overrides = _build_mcp_config_overrides(
+            effective_channel_id,
+            ipc_socket=ipc_socket,
+            base_url=base_url or getattr(api, "base_url", None),
+            token=token,
+            device_key=device_key,
+            device_id=device_id,
+        )
+    else:
+        log.warning("No channel ID available; AI.CHAT MCP tools will not be configured")
 
     try:
         # Outer loop: each iteration is a fresh Codex thread
@@ -489,8 +519,10 @@ async def run_agent(
 
             # Register notification handlers
             agent_text_buffer: list[str] = []
+            completed_agent_messages: list[str] = []
             current_thread_id: str | None = None
             current_turn_id: str | None = None
+            turn_completed_event = asyncio.Event()
 
             async def on_thread_started(params):
                 nonlocal current_thread_id
@@ -503,12 +535,15 @@ async def run_agent(
                 turn = params.get("turn", {})
                 current_turn_id = turn.get("id")
                 hook_state["working"] = True
+                turn_completed_event.clear()
+                completed_agent_messages.clear()
                 log.info("Turn started: %s", current_turn_id)
 
             async def on_turn_completed(params):
                 nonlocal current_turn_id
                 current_turn_id = None
                 hook_state["working"] = False
+                turn_completed_event.set()
                 await api.send_tool_status("idle")
                 log.info("Turn completed")
 
@@ -562,6 +597,7 @@ async def run_agent(
                 elif item_type == "agentMessage":
                     text = item.get("text", "")
                     if text:
+                        completed_agent_messages.append(text)
                         await api.send_tool_status("active", tool="reasoning", description=text)
 
             async def on_command_output_delta(params):
@@ -647,21 +683,19 @@ async def run_agent(
 
                 # Wait for turn to complete (notifications handle the rest)
                 # Then enter message loop
+                deferred_messages: list[dict] = []
                 while True:
-                    pending = _drain_queue(message_queue)
-                    if not pending:
-                        msg_data = await message_queue.get()
-                    elif len(pending) == 1:
-                        msg_data = pending[0]
+                    if deferred_messages:
+                        msg_data = deferred_messages.pop(0)
                     else:
-                        real_msgs = [m for m in pending if not m.get("_system")]
-                        system_msgs = [m for m in pending if m.get("_system")]
-                        if real_msgs:
-                            msg_data = real_msgs[-1]
-                        elif system_msgs:
-                            msg_data = system_msgs[-1]
+                        pending = _drain_queue(message_queue)
+                        if not pending:
+                            msg_data = await message_queue.get()
+                        elif len(pending) == 1:
+                            msg_data = pending[0]
                         else:
-                            continue
+                            msg_data = pending[0]
+                            deferred_messages.extend(pending[1:])
 
                     # System messages
                     if msg_data.get("_system"):
@@ -694,6 +728,7 @@ async def run_agent(
 
                     content = msg_data.get("content", "")
                     message_id = msg_data.get("message_id")
+                    attachments = msg_data.get("attachments") or []
 
                     if message_id:
                         try:
@@ -716,43 +751,22 @@ async def run_agent(
                         await api.send_tool_status("active", tool="compact", description="Compacting context...")
 
                         if current_thread_id:
+                            turn_completed_event.clear()
+                            completed_agent_messages.clear()
+                            agent_text_buffer.clear()
                             await codex.send_request("turn/start", {
                                 "threadId": current_thread_id,
                                 "input": [{"type": "text", "text": COMPACT_PROMPT}],
                             })
-                            # Wait for turn completion and capture agent message
-                            summary_event = asyncio.Event()
-                            summary_parts: list[str] = []
-
-                            original_on_item_completed = on_item_completed
-                            original_on_turn_completed = on_turn_completed
-
-                            async def capture_item_completed(params):
-                                item = params.get("item", {})
-                                if item.get("type") == "agentMessage":
-                                    text = item.get("text", "")
-                                    if text:
-                                        summary_parts.append(text)
-                                await original_on_item_completed(params)
-
-                            async def capture_turn_completed(params):
-                                await original_on_turn_completed(params)
-                                summary_event.set()
-
-                            # Temporarily swap handlers
-                            codex._notification_handlers["item/completed"] = [capture_item_completed]
-                            codex._notification_handlers["turn/completed"] = [capture_turn_completed]
 
                             try:
-                                await asyncio.wait_for(summary_event.wait(), timeout=120)
+                                await asyncio.wait_for(turn_completed_event.wait(), timeout=120)
                             except asyncio.TimeoutError:
                                 log.warning("Compact summary timed out")
 
-                            # Restore handlers
-                            codex._notification_handlers["item/completed"] = [on_item_completed]
-                            codex._notification_handlers["turn/completed"] = [on_turn_completed]
-
-                            summary = "\n".join(summary_parts)
+                            summary = "\n".join(completed_agent_messages).strip()
+                            if not summary:
+                                summary = "".join(agent_text_buffer).strip()
                             if summary.strip():
                                 next_prompt = (
                                     "You are resuming work after a context compaction. "
@@ -769,7 +783,29 @@ async def run_agent(
                         break
 
                     # Normal message
+                    attachment_notes: list[str] = []
+                    for att in attachments:
+                        filename = att.get("filename", "attachment")
+                        content_type = att.get("content_type", "")
+                        if content_type.startswith("image/") and att.get("url"):
+                            try:
+                                img_path = await api.download_attachment(att["url"])
+                                attachment_notes.append(
+                                    f"[Image attached: {filename} — saved to {img_path}]"
+                                )
+                            except Exception as e:
+                                log.warning("Failed to download image attachment: %s", e)
+                                attachment_notes.append(
+                                    f"[Image attached: {filename} — download failed: {e}]"
+                                )
+                        else:
+                            attachment_notes.append(
+                                f"[Attachment: {filename} ({content_type or 'unknown type'})]"
+                            )
+
                     prompt = f"New message from Zech:\n{content}"
+                    if attachment_notes:
+                        prompt += "\n\n" + "\n".join(attachment_notes)
 
                     if current_thread_id:
                         # If turn is active, interrupt then start new turn

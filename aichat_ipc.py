@@ -34,6 +34,7 @@ MSG_SEND_EVENT = "send_event"
 MSG_REPORT_DIRECTORIES = "report_directories"
 MSG_DOWNLOAD_ATTACHMENT = "download_attachment"
 MSG_GET_SESSION = "get_session"
+MSG_GET_UNREAD = "get_unread"
 
 # Manager -> Worker (responses)
 MSG_RESPONSE = "response"
@@ -329,6 +330,13 @@ class IPCClient:
     async def get_session(self):
         """Not needed over IPC — returns None."""
         return None
+
+    async def get_unread_messages(self) -> list[dict]:
+        result = await self._request({
+            "type": MSG_GET_UNREAD,
+            "channel_id": self.channel_id,
+        })
+        return result.get("messages", [])
 
     async def create_interaction(
         self,

@@ -5,9 +5,9 @@ Exposes the same messaging tools as aichat_agent.py's in-process MCP
 (send, read_unread, set_directories) over stdio. Codex spawns this as
 a subprocess and communicates via JSON-RPC.
 
-The server connects to the AI.CHAT manager via IPC using env vars:
-  AICHAT_IPC_SOCKET — path to the manager's Unix domain socket
-  AICHAT_CHANNEL_ID — channel this worker is associated with
+The server can talk to AI.CHAT through either:
+  - IPC (preferred when launched by aichat_manager)
+  - Direct API auth (token or device key), for standalone codex_agent usage
 """
 
 from __future__ import annotations
@@ -26,28 +26,47 @@ log = logging.getLogger(__name__)
 # Resolve config from environment
 IPC_SOCKET = os.environ.get("AICHAT_IPC_SOCKET", "")
 CHANNEL_ID = os.environ.get("AICHAT_CHANNEL_ID", "")
+BASE_URL = os.environ.get("AICHAT_BASE_URL")
+TOKEN = os.environ.get("AICHAT_TOKEN")
+DEVICE_KEY = os.environ.get("AICHAT_DEVICE_KEY")
+DEVICE_ID = os.environ.get("AICHAT_DEVICE_ID")
 
-# Global IPC client (initialized in main)
-_ipc_client = None
+# Global backend client (IPCClient or AiChatAPI)
+_api_client = None
 
 
-async def get_ipc_client():
-    """Lazily connect to the IPC socket."""
-    global _ipc_client
-    if _ipc_client is not None:
-        return _ipc_client
+async def get_api_client():
+    """Lazily connect to IPC or construct a direct API client."""
+    global _api_client
+    if _api_client is not None:
+        return _api_client
 
-    if not IPC_SOCKET or not CHANNEL_ID:
+    if IPC_SOCKET:
+        if not CHANNEL_ID:
+            raise RuntimeError("AICHAT_CHANNEL_ID is required when using AICHAT_IPC_SOCKET")
+        from aichat_ipc import IPCClient
+
+        client = IPCClient(IPC_SOCKET, CHANNEL_ID)
+        await client.connect()
+        _api_client = client
+        log.info("Connected to IPC at %s for channel %s", IPC_SOCKET, CHANNEL_ID)
+        return client
+
+    if not TOKEN and not DEVICE_KEY:
         raise RuntimeError(
-            "AICHAT_IPC_SOCKET and AICHAT_CHANNEL_ID env vars are required"
+            "Provide AICHAT_IPC_SOCKET or direct auth env vars (AICHAT_TOKEN or AICHAT_DEVICE_KEY)"
         )
+    from aichat_api import AiChatAPI
 
-    from aichat_ipc import IPCClient
-    client = IPCClient(IPC_SOCKET, CHANNEL_ID)
-    await client.connect()
-    _ipc_client = client
-    log.info("Connected to IPC at %s for channel %s", IPC_SOCKET, CHANNEL_ID)
-    return client
+    _api_client = AiChatAPI(
+        base_url=BASE_URL,
+        token=TOKEN,
+        device_key=DEVICE_KEY,
+        device_id=DEVICE_ID,
+        channel_id=CHANNEL_ID or None,
+    )
+    log.info("Using direct API client for channel %s", getattr(_api_client, "channel_id", CHANNEL_ID or "?"))
+    return _api_client
 
 
 def create_server() -> Server:
@@ -105,9 +124,9 @@ def create_server() -> Server:
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         try:
-            api = await get_ipc_client()
+            api = await get_api_client()
         except Exception as e:
-            return [TextContent(type="text", text=f"IPC connection error: {e}")]
+            return [TextContent(type="text", text=f"AI.CHAT connection error: {e}")]
 
         if name == "send":
             message = arguments.get("message", "")
@@ -120,10 +139,29 @@ def create_server() -> Server:
                 return [TextContent(type="text", text=f"Failed to send: {e}")]
 
         elif name == "read_unread":
-            # The Codex agent doesn't have a shared message queue like the
-            # Claude agent does (where hooks inject messages mid-turn).
-            # For now, return a note that the queue is managed externally.
-            return [TextContent(type="text", text="No unread messages. Messages are delivered as new turns.")]
+            try:
+                messages = await api.get_unread_messages()
+            except Exception as e:
+                return [TextContent(type="text", text=f"Failed to read unread: {e}")]
+
+            if not messages:
+                return [TextContent(type="text", text="No unread messages.")]
+
+            lines = []
+            for msg in messages[:20]:
+                sender = msg.get("sender", "user")
+                msg_id = msg.get("id") or msg.get("message_id") or "?"
+                content = (msg.get("content") or "").strip()
+                if not content:
+                    content = "[no plaintext content]"
+                if len(content) > 300:
+                    content = content[:300] + "..."
+                lines.append(f"{msg_id} [{sender}]: {content}")
+
+            if len(messages) > 20:
+                lines.append(f"...and {len(messages) - 20} more.")
+
+            return [TextContent(type="text", text="\n".join(lines))]
 
         elif name == "set_directories":
             working_dir = arguments.get("working_directory", "")
