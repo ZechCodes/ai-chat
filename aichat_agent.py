@@ -42,7 +42,7 @@ from aichat_hooks import (
 )
 from aichat_interactions import InteractionManager
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [Claude] %(message)s")
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------

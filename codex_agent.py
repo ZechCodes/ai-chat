@@ -21,7 +21,7 @@ from typing import Any
 from aichat_api import AiChatAPI
 from aichat_interactions import InteractionManager
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [Codex] %(message)s")
 log = logging.getLogger(__name__)
 
 
