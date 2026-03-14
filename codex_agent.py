@@ -76,7 +76,7 @@ class CodexAppServer:
         log.info("Codex app-server initialized")
         return result
 
-    async def send_request(self, method: str, params: dict, timeout: float = 120.0) -> dict:
+    async def send_request(self, method: str, params: dict, timeout: float = 600.0) -> dict:
         """Send a JSON-RPC request and await the response."""
         req_id = self._next_id
         self._next_id += 1
