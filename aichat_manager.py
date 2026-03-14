@@ -790,6 +790,7 @@ class DeviceManager:
                     "pid": w.pid,
                     "started_at": w.started_at,
                     "working_directory": w.working_directory,
+                    "agent_type": w.agent_type,
                 }
                 for cid, w in self.workers.items()
                 if w.pid is not None and isinstance(w.pid, int)
@@ -1099,14 +1100,16 @@ class DeviceManager:
                             working_directory=saved_wd,
                             adopted=True,
                             adopted_pid=pid,
+                            agent_type=saved_pids[channel_id].get("agent_type", "claude"),
                         )
                         continue
                     except OSError:
                         pass  # Dead, start a new one
             ch_info = server_channels[channel_id]
             working_directory = ch_info.get("working_directory", "")
-            log.info("Channel %s assigned to device, starting worker (cwd=%s)", channel_id, working_directory or "<default>")
-            await self.start_worker(channel_id, working_directory=working_directory)
+            saved_agent_type = saved_pids.get(channel_id, {}).get("agent_type", "")
+            log.info("Channel %s assigned to device, starting worker (cwd=%s, agent=%s)", channel_id, working_directory or "<default>", saved_agent_type or self.default_agent_type)
+            await self.start_worker(channel_id, working_directory=working_directory, agent_type=saved_agent_type)
 
     async def report_status(self) -> None:
         """Report device status to the server via WebSocket."""
