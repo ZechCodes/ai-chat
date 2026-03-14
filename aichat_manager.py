@@ -62,6 +62,7 @@ class WorkerProcess:
     channel_token: str
     started_at: float = 0.0
     working_directory: str = ""
+    agent_type: str = "claude"
     adopted: bool = False
     adopted_pid: int | None = None
 
@@ -153,12 +154,14 @@ class DeviceManager:
 
     def __init__(self, device_id: str, private_key_b64: str, base_url: str,
                  key_exchange: KeyExchange | None = None,
-                 encryption_key_b64: str = ""):
+                 encryption_key_b64: str = "",
+                 default_agent_type: str = "claude"):
         self.device_id = device_id
         self.private_key_b64 = private_key_b64
         self.base_url = base_url
         self.key_exchange = key_exchange  # Only used for ECDH transport in rekey
         self.encryption_key_b64 = encryption_key_b64  # Canonical key for all message encryption
+        self.default_agent_type = default_agent_type
         self.workers: dict[str, WorkerProcess] = {}
         self.last_event_ts: str | None = None
 
@@ -805,7 +808,8 @@ class DeviceManager:
             pass  # Already dead
 
     async def start_worker(
-        self, channel_id: str, channel_token: str = "", working_directory: str = ""
+        self, channel_id: str, channel_token: str = "", working_directory: str = "",
+        agent_type: str = "",
     ) -> None:
         """Launch a worker subprocess for the given channel.
 
@@ -826,10 +830,13 @@ class DeviceManager:
         env["AICHAT_DEVICE_ID"] = self.device_id
         env["AICHAT_CHANNEL_ID"] = channel_id
 
-        # Use absolute path for agent script since cwd may differ
-        agent_script = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "aichat_agent.py"
-        )
+        # Select agent script based on type
+        effective_agent_type = agent_type or self.default_agent_type
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        if effective_agent_type == "codex":
+            agent_script = os.path.join(script_dir, "codex_agent.py")
+        else:
+            agent_script = os.path.join(script_dir, "aichat_agent.py")
 
         # Determine working directory: use specified dir if valid, else manager dir
         manager_dir = os.path.dirname(os.path.abspath(__file__))
@@ -852,10 +859,11 @@ class DeviceManager:
             channel_id=channel_id,
             channel_token=channel_token,
             working_directory=working_directory,
+            agent_type=effective_agent_type,
         )
         log.info(
-            "Started worker for channel %s (pid=%s, cwd=%s)",
-            channel_id, proc.pid, cwd,
+            "Started %s worker for channel %s (pid=%s, cwd=%s)",
+            effective_agent_type, channel_id, proc.pid, cwd,
         )
         self._save_worker_pids()
 
@@ -925,7 +933,7 @@ class DeviceManager:
             log.error("Failed to delete device: %s", e)
             return False
 
-    async def create_channel(self, name: str, working_directory: str = "") -> str | None:
+    async def create_channel(self, name: str, working_directory: str = "", agent_type: str = "") -> str | None:
         """Create a new channel via WebSocket and start its worker."""
         try:
             data = await self._ws_request({
@@ -946,7 +954,7 @@ class DeviceManager:
                 working_directory=wd,
             )
 
-            await self.start_worker(channel_id, working_directory=wd)
+            await self.start_worker(channel_id, working_directory=wd, agent_type=agent_type)
             return channel_id
         except Exception as e:
             log.error("Failed to create channel: %s", e)
@@ -962,6 +970,7 @@ class DeviceManager:
                 payload["channel_id"],
                 payload.get("channel_token", ""),
                 payload.get("working_directory", ""),
+                agent_type=payload.get("agent_type", ""),
             )
         elif command == "worker:stop":
             await self.stop_worker(payload["channel_id"])
@@ -970,10 +979,14 @@ class DeviceManager:
             token = self.workers.get(channel_id, None)
             channel_token = token.channel_token if token else payload.get("channel_token", "")
             working_directory = payload.get("working_directory", "")
+            prev_agent_type = token.agent_type if token else ""
             # Fall back to previously known working directory
             if not working_directory and token:
                 working_directory = token.working_directory
-            await self.start_worker(channel_id, channel_token, working_directory)
+            await self.start_worker(
+                channel_id, channel_token, working_directory,
+                agent_type=payload.get("agent_type", prev_agent_type),
+            )
         elif command == "device:ping":
             log.info("Ping received, reporting status")
             await self.report_status()
@@ -1222,6 +1235,7 @@ async def run_manager(
     force_stop: bool = False,
     create_channel_name: str | None = None,
     create_channel_wd: str = "",
+    default_agent_type: str = "claude",
 ) -> None:
     """Main manager entry point."""
     from aichat_crypto import KeyExchange, generate_x25519_keypair
@@ -1263,6 +1277,7 @@ async def run_manager(
         base_url=config.base_url,
         key_exchange=key_exchange,
         encryption_key_b64=config.encryption_key_b64,
+        default_agent_type=default_agent_type,
     )
 
     # Open local database and start IPC server before connecting WebSocket
@@ -1289,7 +1304,10 @@ async def run_manager(
                 if cmd in ("new", "create"):
                     name = parts[1] if len(parts) > 1 else ""
                     wd = parts[2] if len(parts) > 2 else ""
-                    await mgr.create_channel(name, wd)
+                    # Check for --codex flag in remaining args
+                    at = "codex" if any(p == "--codex" for p in parts) else ""
+                    wd = wd if wd != "--codex" else ""
+                    await mgr.create_channel(name, wd, agent_type=at)
                 elif cmd == "rename":
                     name = " ".join(parts[1:]) if len(parts) > 1 else ""
                     if not name:
@@ -1314,7 +1332,7 @@ async def run_manager(
                         print("  No workers running")
                 elif cmd in ("help", "?"):
                     print("Commands:")
-                    print("  new <name> [working_directory]  — create a channel and start a worker")
+                    print("  new <name> [working_directory] [--codex]  — create a channel and start a worker")
                     print("  rename <name>                   — rename this device")
                     print("  delete confirm                  — delete this device and exit")
                     print("  status                          — show worker status")
@@ -1369,11 +1387,18 @@ def main() -> None:
         default="",
         help="Working directory for the new channel (used with --new)",
     )
+    parser.add_argument(
+        "--agent-type",
+        choices=["claude", "codex"],
+        default="claude",
+        help="Default agent type for workers (default: claude)",
+    )
     args = parser.parse_args()
     asyncio.run(run_manager(
         force_stop=args.stop,
         create_channel_name=args.new,
         create_channel_wd=args.working_directory,
+        default_agent_type=args.agent_type,
     ))
 
 

@@ -145,6 +145,15 @@ class AiChatAPI:
             resp.raise_for_status()
             return resp.json()
 
+    async def get_unread_messages(self) -> list[dict]:
+        """GET /api/messages/unread — fetch messages not yet read by Claude."""
+        path = "/api/messages/unread"
+        headers = self._sign_request("GET", path)
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(f"{self.base_url}{path}", headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+
     async def download_attachment(self, url: str) -> str:
         """Download an attachment to a temp file, return the file path."""
         full_url = url if url.startswith("http") else f"{self.base_url}{url}"

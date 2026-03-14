@@ -4,6 +4,9 @@
 Launches Claude Code as an SDK-managed agent with hooks that report tool use,
 stop state, and messages directly to AI.CHAT API endpoints.
 
+When launched with --ipc-socket, all server communication goes through the
+manager process via IPC. Otherwise falls back to direct HTTP API calls.
+
 Usage:
     uv run python3 aichat_agent.py [initial prompt]
 """
@@ -14,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 
 import httpx
 
@@ -63,16 +67,53 @@ async def _patched_wait_for_result_and_end_input(self) -> None:
 _sdk_query.Query.wait_for_result_and_end_input = _patched_wait_for_result_and_end_input
 
 
-def make_aichat_tools(api: AiChatAPI):
+def make_aichat_tools(api, message_queue, skipped_messages, hook_state):
     """Create SDK MCP tools for AI.CHAT messaging and directory management."""
 
     @tool("send", "Send a message to the user via AI.CHAT", {"message": str})
     async def aichat_send(args):
         try:
             result = await api.send_message(args["message"])
+            hook_state["last_send_time"] = time.time()
             return {"content": [{"type": "text", "text": f"Message sent: {result.get('id', 'ok')}"}]}
         except Exception as e:
             return {"content": [{"type": "text", "text": f"Failed to send: {e}"}], "is_error": True}
+
+    @tool(
+        "read_unread",
+        "Read unread messages from Zech. Call this when notified about unread messages.",
+        {},
+    )
+    async def aichat_read_unread(args):
+        messages = []
+        # Drain skipped (older) messages first
+        while skipped_messages:
+            messages.append(skipped_messages.pop(0))
+        # Then drain the live queue (skip system messages)
+        while not message_queue.empty():
+            try:
+                m = message_queue.get_nowait()
+                if not m.get("_system"):
+                    messages.append(m)
+            except asyncio.QueueEmpty:
+                break
+        if not messages:
+            return {"content": [{"type": "text", "text": "No unread messages."}]}
+        # Mark all as read
+        ids_to_mark = [m["message_id"] for m in messages if m.get("message_id")]
+        if ids_to_mark:
+            try:
+                await api.mark_read(ids_to_mark)
+            except Exception as e:
+                log.warning("Failed to mark messages read: %s", e)
+        # Format output
+        lines = []
+        for m in messages:
+            content = m.get("content", "")
+            att = m.get("attachments", [])
+            att_note = f" [{len(att)} attachment(s)]" if att else ""
+            lines.append(f"Zech: {content}{att_note}")
+        return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
     @tool(
         "set_directories",
@@ -89,21 +130,22 @@ def make_aichat_tools(api: AiChatAPI):
         except Exception as e:
             return {"content": [{"type": "text", "text": f"Failed to update directories: {e}"}], "is_error": True}
 
-    return [aichat_send, aichat_set_directories]
+    return [aichat_send, aichat_read_unread, aichat_set_directories]
 
 
 def build_agent_options(
-    api: AiChatAPI,
+    api,
     interactions: InteractionManager,
+    message_queue: asyncio.Queue,
+    skipped_messages: list,
+    hook_state: dict,
 ) -> ClaudeAgentOptions:
     """Build ClaudeAgentOptions with AI.CHAT hooks and tools."""
-    tools = make_aichat_tools(api)
+    tools = make_aichat_tools(api, message_queue, skipped_messages, hook_state)
     mcp_server = create_sdk_mcp_server("aichat", tools=tools)
 
-    # Shared state between hooks and can_use_tool for tracking Write calls
-    hook_state: dict = {}
-
     return ClaudeAgentOptions(
+        model="opus",
         setting_sources=["project"],
         permission_mode="plan",
         can_use_tool=make_can_use_tool(api, interactions, hook_state),
@@ -115,14 +157,14 @@ def build_agent_options(
                 # Regular tool status reporting + Write tracking
                 HookMatcher(hooks=[make_pre_tool_hook(api, hook_state)]),
             ],
-            "PostToolUse": [HookMatcher(hooks=[make_post_tool_hook(api)])],
+            "PostToolUse": [HookMatcher(hooks=[make_post_tool_hook(api, message_queue, hook_state)])],
             "PreCompact": [HookMatcher(hooks=[make_pre_compact_hook(api)])],
             "Stop": [HookMatcher(hooks=[make_stop_hook(api)])],
         },
     )
 
 
-async def handle_response_message(message, api: AiChatAPI) -> str | None:
+async def handle_response_message(message, api) -> str | None:
     """Report agent response messages as reasoning tool status.
 
     AssistantMessage text blocks are internal narration (explicit aichat-send
@@ -230,7 +272,10 @@ async def listen_sse(
     interactions: InteractionManager,
     api: AiChatAPI,
 ) -> None:
-    """Listen to Skrift SSE stream for real-time incoming messages and interaction responses."""
+    """Listen to Skrift SSE stream for real-time incoming messages and interaction responses.
+
+    Only used when running without IPC (standalone mode).
+    """
     while True:
         try:
             cookies = await api.get_session()
@@ -267,6 +312,56 @@ async def listen_sse(
             await asyncio.sleep(10)
 
 
+async def listen_ipc(
+    message_queue: asyncio.Queue,
+    interactions: InteractionManager,
+    ipc_client,
+) -> None:
+    """Listen for pushed events from manager via IPC.
+
+    Replaces listen_sse when running with --ipc-socket.
+    """
+    from aichat_ipc import MSG_EVENT_MESSAGE, MSG_EVENT_PLAN, MSG_EVENT_INTERACTION_RESPONSE
+
+    async def handle_event(msg: dict) -> None:
+        msg_type = msg.get("type")
+
+        if msg_type == MSG_EVENT_MESSAGE:
+            log.info("IPC: received message from Zech")
+            interactions.cancel_all()
+            await message_queue.put({
+                "message_id": msg.get("message_id"),
+                "content": msg.get("content", ""),
+                "attachments": msg.get("attachments", []),
+            })
+
+        elif msg_type == MSG_EVENT_PLAN:
+            log.info("IPC: plan event: %s", msg.get("content"))
+            await message_queue.put({
+                "content": msg.get("content", ""),
+            })
+
+        elif msg_type == MSG_EVENT_INTERACTION_RESPONSE:
+            interaction_id = msg.get("interaction_id")
+            if interaction_id:
+                log.info("IPC: received interaction response %s", interaction_id)
+                interactions.deliver_response(interaction_id, {
+                    "interaction_id": interaction_id,
+                    "action": msg.get("action"),
+                    "answer": msg.get("answer", ""),
+                    "reason": msg.get("reason", ""),
+                })
+
+    ipc_client.on_event(handle_event)
+    # The IPC client's _listen task handles the actual reading.
+    # We just need to keep this coroutine alive so the task group doesn't exit.
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        pass
+
+
 SSE_CONTEXT = (
     "IMPORTANT: You are communicating with the user through a chat interface.\n"
     "- The user CANNOT see your text responses. The ONLY way to communicate "
@@ -285,6 +380,41 @@ SSE_CONTEXT = (
 )
 
 
+async def silence_reminder_task(
+    message_queue: asyncio.Queue,
+    hook_state: dict,
+) -> None:
+    """Background task that injects a silence reminder into the queue when idle."""
+    _SILENCE_THRESHOLD = 120  # seconds
+    _CHECK_INTERVAL = 30  # seconds
+
+    while True:
+        await asyncio.sleep(_CHECK_INTERVAL)
+        now = time.time()
+        last_send = hook_state.get("last_send_time", now)
+        last_remind = hook_state.get("last_silence_remind_bg", 0)
+        if now - last_send >= _SILENCE_THRESHOLD and now - last_remind >= _SILENCE_THRESHOLD:
+            hook_state["last_silence_remind_bg"] = now
+            await message_queue.put({
+                "_system": True,
+                "content": (
+                    "[System: You haven't messaged Zech in over 2 minutes. "
+                    "Consider using mcp__aichat__send to update them on your progress.]"
+                ),
+            })
+
+
+def _drain_queue(message_queue: asyncio.Queue) -> list[dict]:
+    """Drain all currently pending items from the queue without blocking."""
+    items = []
+    while not message_queue.empty():
+        try:
+            items.append(message_queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+    return items
+
+
 async def run_agent(
     initial_prompt: str | None = None,
     token: str | None = None,
@@ -292,17 +422,35 @@ async def run_agent(
     device_id: str | None = None,
     channel_id: str | None = None,
     base_url: str | None = None,
+    ipc_socket: str | None = None,
 ) -> None:
     """Main agent loop with support for /clear and /compact context resets."""
-    api = AiChatAPI(
-        token=token,
-        device_key=device_key,
-        device_id=device_id,
-        channel_id=channel_id,
-        base_url=base_url,
-    )
+
+    # Choose API backend: IPC (via manager) or direct HTTP
+    if ipc_socket:
+        from aichat_ipc import IPCClient
+        api = IPCClient(ipc_socket, channel_id)
+        await api.connect()
+        log.info("Using IPC for server communication via %s", ipc_socket)
+    else:
+        api = AiChatAPI(
+            token=token,
+            device_key=device_key,
+            device_id=device_id,
+            channel_id=channel_id,
+            base_url=base_url,
+        )
+        log.info("Using direct HTTP for server communication")
+
     interactions = InteractionManager()
     message_queue: asyncio.Queue[dict] = asyncio.Queue()
+    skipped_messages: list[dict] = []  # Older messages deferred by latest-first logic
+    hook_state: dict = {
+        "last_send_time": time.time(),
+        "last_unread_notify": 0,
+        "last_silence_remind": 0,
+        "last_silence_remind_bg": 0,
+    }
 
     # Report working directory to server
     cwd = os.getcwd()
@@ -313,10 +461,17 @@ async def run_agent(
         log.warning("Failed to report working directory: %s", e)
 
     await api.send_message("Agent online.")
-    log.info("Agent started, channel=%s, cwd=%s", api.channel_id, cwd)
+    hook_state["last_send_time"] = time.time()
+    log.info("Agent started, channel=%s, cwd=%s", channel_id or getattr(api, 'channel_id', '?'), cwd)
 
-    # Start SSE listener (persists across context resets)
-    sse_task = asyncio.create_task(listen_sse(message_queue, interactions, api))
+    # Start event listener (IPC or SSE depending on mode)
+    if ipc_socket:
+        event_task = asyncio.create_task(listen_ipc(message_queue, interactions, api))
+    else:
+        event_task = asyncio.create_task(listen_sse(message_queue, interactions, api))
+
+    # Start silence reminder background task
+    reminder_task = asyncio.create_task(silence_reminder_task(message_queue, hook_state))
 
     # next_prompt carries context across resets (None = default check-in)
     next_prompt: str | None = initial_prompt
@@ -324,7 +479,7 @@ async def run_agent(
     try:
         # Outer loop: each iteration is a fresh agent context
         while True:
-            options = build_agent_options(api, interactions)
+            options = build_agent_options(api, interactions, message_queue, skipped_messages, hook_state)
             reset_reason: str | None = None
 
             async with ClaudeSDKClient(options=options) as client:
@@ -343,7 +498,35 @@ async def run_agent(
                 # Message loop
                 pending_plan_event = None
                 while True:
-                    msg_data = await message_queue.get()
+                    # Drain queue: latest-first when multiple messages pending
+                    pending = _drain_queue(message_queue)
+                    if not pending:
+                        # Nothing available — block for the next message
+                        msg_data = await message_queue.get()
+                    elif len(pending) == 1:
+                        msg_data = pending[0]
+                    else:
+                        # Multiple pending: take the latest, store older in skipped_messages
+                        # Separate system messages and real messages
+                        real_msgs = [m for m in pending if not m.get("_system")]
+                        system_msgs = [m for m in pending if m.get("_system")]
+                        if real_msgs:
+                            msg_data = real_msgs[-1]  # latest real message
+                            skipped_messages.extend(real_msgs[:-1])  # older real messages
+                            # System messages that queued up alongside real messages can be dropped
+                        elif system_msgs:
+                            msg_data = system_msgs[-1]  # latest system message
+                        else:
+                            continue  # shouldn't happen, but be safe
+
+                    # --- System messages: inject content directly, no mark_read ---
+                    if msg_data.get("_system"):
+                        prompt = msg_data.get("content", "")
+                        if prompt:
+                            await client.query(prompt)
+                            async for message in client.receive_response():
+                                await handle_response_message(message, api)
+                        continue
 
                     # Plan events: buffer and wait for the next user message
                     if msg_data.get("content", "").startswith("plan:"):
@@ -369,6 +552,7 @@ async def run_agent(
                     if command == "/clear":
                         log.info("Slash command: /clear — resetting context")
                         await api.send_message("Context cleared.")
+                        hook_state["last_send_time"] = time.time()
                         next_prompt = None
                         reset_reason = "clear"
                         break
@@ -403,6 +587,7 @@ async def run_agent(
                             next_prompt = None
 
                         await api.send_message("Context compacted.")
+                        hook_state["last_send_time"] = time.time()
                         reset_reason = "compact"
                         break
 
@@ -430,6 +615,14 @@ async def run_agent(
                     if attachment_notes:
                         prompt += "\n\n" + "\n".join(attachment_notes)
 
+                    # Note about skipped older messages
+                    if skipped_messages:
+                        n = len(skipped_messages)
+                        prompt += (
+                            f"\n\n[System: There are {n} older message(s). "
+                            f"Use the mcp__aichat__read_unread tool to read them.]"
+                        )
+
                     # Inject plan mode instruction if a plan event was buffered
                     if pending_plan_event:
                         if pending_plan_event == "plan:enter":
@@ -453,11 +646,16 @@ async def run_agent(
             pass
         raise
     finally:
-        sse_task.cancel()
-        try:
-            await sse_task
-        except asyncio.CancelledError:
-            pass
+        reminder_task.cancel()
+        event_task.cancel()
+        for task in (reminder_task, event_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        # Clean up IPC connection if applicable
+        if ipc_socket and hasattr(api, 'close'):
+            await api.close()
 
 
 def main() -> None:
@@ -470,6 +668,7 @@ def main() -> None:
     parser.add_argument("--channel-id", help="Channel ID")
     parser.add_argument("--base-url", help="API base URL")
     parser.add_argument("--working-directory", help="Working directory for this agent")
+    parser.add_argument("--ipc-socket", help="Path to manager's IPC Unix domain socket")
     args = parser.parse_args()
 
     # Change to working directory if specified
@@ -485,6 +684,7 @@ def main() -> None:
         device_id=args.device_id,
         channel_id=args.channel_id,
         base_url=args.base_url,
+        ipc_socket=args.ipc_socket,
     ))
 
 

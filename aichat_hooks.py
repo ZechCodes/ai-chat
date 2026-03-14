@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -270,8 +272,16 @@ def _format_edit_diff(tool_input: dict) -> str | None:
     return "\n".join(lines)
 
 
-def make_post_tool_hook(api: ChatAPI):
-    """Create a PostToolUse hook that reports done status."""
+def make_post_tool_hook(
+    api: ChatAPI,
+    message_queue: asyncio.Queue | None = None,
+    hook_state: dict | None = None,
+):
+    """Create a PostToolUse hook that reports done status and notifies about unread messages / silence."""
+
+    _UNREAD_THROTTLE = 30  # seconds between unread notifications
+    _SILENCE_THRESHOLD = 120  # seconds before silence reminder
+    _SILENCE_THROTTLE = 120  # seconds between silence reminders
 
     async def hook(input_data, tool_use_id, context):
         tool_name = input_data.get("tool_name", "")
@@ -299,6 +309,43 @@ def make_post_tool_hook(api: ChatAPI):
                 )
 
         await api.send_tool_status("done", tool=tool_name)
+
+        # Build additional context for the agent (unread notifications + silence reminders)
+        notifications = []
+
+        if message_queue is not None and hook_state is not None:
+            now = time.time()
+
+            # Unread message notification (throttled to every 30s)
+            unread_count = message_queue.qsize()
+            if unread_count > 0:
+                last_notify = hook_state.get("last_unread_notify", 0)
+                if now - last_notify >= _UNREAD_THROTTLE:
+                    hook_state["last_unread_notify"] = now
+                    notifications.append(
+                        f"[System: You have {unread_count} unread message(s) from Zech. "
+                        f"Use the mcp__aichat__read_unread tool to read them.]"
+                    )
+
+            # Silence reminder (throttled to every 2min)
+            last_send = hook_state.get("last_send_time", now)
+            if now - last_send >= _SILENCE_THRESHOLD:
+                last_remind = hook_state.get("last_silence_remind", 0)
+                if now - last_remind >= _SILENCE_THROTTLE:
+                    hook_state["last_silence_remind"] = now
+                    notifications.append(
+                        "[System: You haven't messaged Zech in over 2 minutes. "
+                        "Consider using mcp__aichat__send to update them on your progress.]"
+                    )
+
+        if notifications:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": "\n".join(notifications),
+                }
+            }
+
         return {}
 
     return hook
