@@ -380,17 +380,25 @@ class DeviceManager:
         channel_id = event.get("channel_id", "")
         request_id = event.get("request_id", "")
         before_id = event.get("before")
-        limit = min(event.get("limit", 100), 200)
+        limit = min(event.get("limit", 100), 500)
+        message_ids = event.get("message_ids")
 
         if not channel_id or not request_id:
             return
 
         try:
-            messages = await self.local_db.get_messages(
-                channel_id, limit=limit + 1, before_id=before_id
-            )
-            has_more = len(messages) > limit
-            messages = messages[:limit]
+            # If specific message IDs requested, fetch those directly
+            if message_ids and isinstance(message_ids, list):
+                messages = await self.local_db.get_messages_by_ids(
+                    channel_id, message_ids[:200]
+                )
+                has_more = False
+            else:
+                messages = await self.local_db.get_messages(
+                    channel_id, limit=limit + 1, before_id=before_id
+                )
+                has_more = len(messages) > limit
+                messages = messages[:limit]
 
             # Encrypt each message for the browser
             encrypted_messages = []

@@ -163,6 +163,24 @@ class LocalDB:
         rows = await cursor.fetchall()
         return [dict(row) for row in reversed(rows)]  # Return in chronological order
 
+    async def get_messages_by_ids(
+        self,
+        channel_id: str,
+        message_ids: list[str],
+    ) -> list[dict]:
+        """Get specific messages by ID for a channel."""
+        if not message_ids:
+            return []
+        placeholders = ",".join("?" for _ in message_ids)
+        cursor = await self.db.execute(
+            f"""SELECT * FROM messages
+               WHERE channel_id = ? AND id IN ({placeholders})
+               ORDER BY created_at ASC""",
+            [channel_id] + message_ids,
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
     async def mark_read_by_claude(self, message_ids: list[str]) -> None:
         """Mark messages as read by the agent."""
         now = _now()
