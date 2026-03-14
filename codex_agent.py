@@ -40,6 +40,8 @@ class CodexAppServer:
         self._notification_handlers: dict[str, list] = {}
         self._request_handlers: dict[str, Any] = {}
         self._reader_task: asyncio.Task | None = None
+        self._stderr_task: asyncio.Task | None = None
+        self._write_lock = asyncio.Lock()
         self._config_overrides = config_overrides or []
 
     def on_notification(self, method: str, handler):
@@ -64,7 +66,8 @@ class CodexAppServer:
         )
         log.info("Codex app-server started (pid=%s)", self._proc.pid)
 
-        # Start background reader
+        # Start background readers
+        self._stderr_task = asyncio.create_task(self._read_stderr_loop())
         self._reader_task = asyncio.create_task(self._read_loop())
 
         # Initialize handshake
@@ -115,8 +118,27 @@ class CodexAppServer:
         if not self._proc or not self._proc.stdin:
             raise ConnectionError("Codex app-server not running")
         data = json.dumps(msg, separators=(",", ":")).encode() + b"\n"
-        self._proc.stdin.write(data)
-        await self._proc.stdin.drain()
+        # Multiple coroutines can write concurrently (turn/start + approval responses).
+        # Serialize writes so JSON lines never interleave on the pipe.
+        async with self._write_lock:
+            self._proc.stdin.write(data)
+            await self._proc.stdin.drain()
+
+    async def _read_stderr_loop(self) -> None:
+        """Continuously drain stderr so the app-server cannot block on a full pipe."""
+        assert self._proc and self._proc.stderr
+        try:
+            while True:
+                line = await self._proc.stderr.readline()
+                if not line:
+                    break
+                text = line.decode(errors="replace").strip()
+                if text:
+                    log.debug("Codex app-server stderr: %s", text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.debug("Codex stderr reader error: %s", e)
 
     async def _read_loop(self) -> None:
         """Background task: read stdout, dispatch responses/notifications/requests."""
@@ -194,6 +216,12 @@ class CodexAppServer:
             self._reader_task.cancel()
             try:
                 await self._reader_task
+            except asyncio.CancelledError:
+                pass
+        if self._stderr_task:
+            self._stderr_task.cancel()
+            try:
+                await self._stderr_task
             except asyncio.CancelledError:
                 pass
         if self._proc:
@@ -552,6 +580,23 @@ async def run_agent(
     reminder_task = asyncio.create_task(silence_reminder_task(message_queue, hook_state))
 
     next_prompt: str | None = initial_prompt
+    status_tasks: set[asyncio.Task] = set()
+
+    async def _send_tool_status_safe(status: str, *, tool: str = "", description: str = "") -> None:
+        try:
+            await asyncio.wait_for(
+                api.send_tool_status(status, tool=tool, description=description),
+                timeout=5,
+            )
+        except Exception as e:
+            log.debug("Tool status send failed (%s/%s): %s", status, tool or "-", e)
+
+    def _send_tool_status_async(status: str, *, tool: str = "", description: str = "") -> None:
+        task = asyncio.create_task(
+            _send_tool_status_safe(status, tool=tool, description=description)
+        )
+        status_tasks.add(task)
+        task.add_done_callback(status_tasks.discard)
 
     # Build MCP config overrides for codex app-server
     config_overrides: list[str] = []
@@ -600,7 +645,7 @@ async def run_agent(
                 current_turn_id = None
                 hook_state["working"] = False
                 turn_completed_event.set()
-                await api.send_tool_status("idle")
+                _send_tool_status_async("idle")
                 log.info("Turn completed")
 
             async def on_agent_message_delta(params):
@@ -613,7 +658,7 @@ async def run_agent(
                 item_type = item.get("type", "")
                 if item_type == "commandExecution":
                     cmd = item.get("command", "")
-                    await api.send_tool_status("active", tool="Bash", description=f"Running: {cmd}")
+                    _send_tool_status_async("active", tool="Bash", description=f"Running: {cmd}")
                 elif item_type == "fileChange":
                     changes = item.get("changes", [])
                     if changes:
@@ -621,17 +666,17 @@ async def run_agent(
                         desc = f"Editing {', '.join(os.path.basename(p) for p in paths[:3])}" if paths else "Editing files"
                     else:
                         desc = "Editing files"
-                    await api.send_tool_status("active", tool="Edit", description=desc)
+                    _send_tool_status_async("active", tool="Edit", description=desc)
                 elif item_type == "mcpToolCall":
                     tool_name = item.get("tool", "")
                     server = item.get("server", "")
                     mcp_tool = _format_mcp_tool_name(server, tool_name)
-                    await api.send_tool_status("active", tool=mcp_tool, description=f"Calling {tool_name}")
+                    _send_tool_status_async("active", tool=mcp_tool, description=f"Calling {tool_name}")
                 elif item_type == "agentMessage":
                     agent_text_buffer.clear()
-                    await api.send_tool_status("active", tool="reasoning", description="Thinking...")
+                    _send_tool_status_async("active", tool="reasoning", description="Thinking...")
                 elif item_type == "reasoning":
-                    await api.send_tool_status("active", tool="reasoning", description="Reasoning...")
+                    _send_tool_status_async("active", tool="reasoning", description="Reasoning...")
 
             async def on_item_completed(params):
                 item = params.get("item", {})
@@ -640,22 +685,26 @@ async def run_agent(
                     output = item.get("aggregatedOutput", "")
                     cmd = item.get("command", "")
                     if output:
-                        await api.send_tool_status("active", tool="Bash", description=f"output:Running: {cmd}\n{output}")
-                    await api.send_tool_status("done", tool="Bash")
+                        _send_tool_status_async(
+                            "active",
+                            tool="Bash",
+                            description=f"output:Running: {cmd}\n{output}",
+                        )
+                    _send_tool_status_async("done", tool="Bash")
                 elif item_type == "fileChange":
-                    await api.send_tool_status("done", tool="Edit")
+                    _send_tool_status_async("done", tool="Edit")
                 elif item_type == "mcpToolCall":
                     tool_name = item.get("tool", "")
                     server = item.get("server", "")
                     # Check if this was an aichat send call — update send time
                     if server == "aichat" and tool_name == "send":
                         hook_state["last_send_time"] = time.time()
-                    await api.send_tool_status("done", tool=_format_mcp_tool_name(server, tool_name))
+                    _send_tool_status_async("done", tool=_format_mcp_tool_name(server, tool_name))
                 elif item_type == "agentMessage":
                     text = item.get("text", "")
                     if text:
                         completed_agent_messages.append(text)
-                        await api.send_tool_status("active", tool="reasoning", description=text)
+                        _send_tool_status_async("active", tool="reasoning", description=text)
 
             async def on_command_output_delta(params):
                 # Just let it stream; we report final output on item/completed
@@ -816,7 +865,11 @@ async def run_agent(
 
                     if command == "/compact":
                         log.info("/compact — summarizing then resetting")
-                        await api.send_tool_status("active", tool="compact", description="Compacting context...")
+                        await _send_tool_status_safe(
+                            "active",
+                            tool="compact",
+                            description="Compacting context...",
+                        )
 
                         if current_thread_id:
                             turn_completed_event.clear()
@@ -920,6 +973,11 @@ async def run_agent(
             pass
         raise
     finally:
+        for task in list(status_tasks):
+            task.cancel()
+        for task in list(status_tasks):
+            with suppress(asyncio.CancelledError):
+                await task
         reminder_task.cancel()
         event_task.cancel()
         for task in (reminder_task, event_task):
