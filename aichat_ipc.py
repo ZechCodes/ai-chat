@@ -68,7 +68,10 @@ class IPCServer:
         """
         self.socket_path = socket_path
         self.on_request = on_request
+        # Primary worker connections (receive events)
         self._workers: dict[str, asyncio.StreamWriter] = {}  # channel_id -> writer
+        # Additional connections (e.g. MCP server subprocesses) — can send requests but don't receive events
+        self._aux_connections: dict[str, list[asyncio.StreamWriter]] = {}
         self._server: asyncio.Server | None = None
 
     @property
@@ -98,6 +101,11 @@ class IPCServer:
             writer.close()
         self._workers.clear()
 
+        for writers in self._aux_connections.values():
+            for writer in writers:
+                writer.close()
+        self._aux_connections.clear()
+
         if os.path.exists(self.socket_path):
             os.unlink(self.socket_path)
 
@@ -124,12 +132,20 @@ class IPCServer:
     ) -> None:
         """Handle a single worker connection."""
         channel_id: str | None = None
+        is_primary = False  # True if this connection is the primary worker (receives events)
         try:
             async for msg in _read_messages(reader):
                 if msg.get("type") == MSG_REGISTER:
                     channel_id = msg["channel_id"]
-                    self._workers[channel_id] = writer
-                    log.info("IPC: worker registered for channel %s", channel_id)
+                    if channel_id not in self._workers:
+                        # First connection for this channel — primary worker
+                        self._workers[channel_id] = writer
+                        is_primary = True
+                        log.info("IPC: worker registered for channel %s", channel_id)
+                    else:
+                        # Additional connection (e.g. MCP server subprocess)
+                        self._aux_connections.setdefault(channel_id, []).append(writer)
+                        log.info("IPC: auxiliary connection registered for channel %s", channel_id)
                     continue
 
                 if not channel_id:
@@ -163,8 +179,14 @@ class IPCServer:
             log.error("IPC: unexpected error in connection handler: %s", e)
         finally:
             if channel_id:
-                self._workers.pop(channel_id, None)
-                log.info("IPC: worker disconnected for channel %s", channel_id)
+                if is_primary:
+                    self._workers.pop(channel_id, None)
+                    log.info("IPC: worker disconnected for channel %s", channel_id)
+                else:
+                    aux_list = self._aux_connections.get(channel_id, [])
+                    if writer in aux_list:
+                        aux_list.remove(writer)
+                    log.info("IPC: auxiliary connection disconnected for channel %s", channel_id)
             writer.close()
 
 
