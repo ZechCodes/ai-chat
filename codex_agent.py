@@ -15,7 +15,6 @@ import asyncio
 import json
 import logging
 import os
-import tempfile
 import time
 from typing import Any
 
@@ -33,14 +32,14 @@ log = logging.getLogger(__name__)
 class CodexAppServer:
     """Low-level JSON-RPC client over stdin/stdout of `codex app-server`."""
 
-    def __init__(self, extra_env: dict[str, str] | None = None):
+    def __init__(self, config_overrides: list[str] | None = None):
         self._proc: asyncio.subprocess.Process | None = None
         self._next_id = 1
         self._pending: dict[int | str, asyncio.Future] = {}
         self._notification_handlers: dict[str, list] = {}
         self._request_handlers: dict[str, Any] = {}
         self._reader_task: asyncio.Task | None = None
-        self._extra_env = extra_env or {}
+        self._config_overrides = config_overrides or []
 
     def on_notification(self, method: str, handler):
         """Register a handler for server notifications."""
@@ -53,14 +52,14 @@ class CodexAppServer:
     async def start(self) -> dict:
         """Spawn codex app-server, perform initialize handshake, return server capabilities."""
         cmd = ["codex", "app-server"]
+        for override in self._config_overrides:
+            cmd.extend(["-c", override])
 
-        env = {**os.environ, **self._extra_env}
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=env,
         )
         log.info("Codex app-server started (pid=%s)", self._proc.pid)
 
@@ -249,32 +248,20 @@ def _parse_slash_command(content: str) -> str | None:
 # MCP config generation
 # ---------------------------------------------------------------------------
 
-def _setup_codex_home(ipc_socket: str, channel_id: str) -> str:
-    """Create a temporary CODEX_HOME directory with config.toml for our MCP server.
+def _build_mcp_config_overrides(ipc_socket: str, channel_id: str) -> list[str]:
+    """Build -c flag overrides for codex app-server to configure our MCP server.
 
-    Returns the path to the temp directory (set as CODEX_HOME env var).
+    Uses -c flags so Codex keeps its normal CODEX_HOME (and auth tokens).
     """
     mcp_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aichat_mcp_server.py")
 
-    lines = [
-        '[mcp_servers.aichat]',
-        'type = "stdio"',
-        'command = "uv"',
-        f'args = ["run", "python3", "{mcp_script}"]',
-        '',
-        '[mcp_servers.aichat.env]',
-        f'AICHAT_IPC_SOCKET = "{ipc_socket}"',
-        f'AICHAT_CHANNEL_ID = "{channel_id}"',
-        '',
+    return [
+        'mcp_servers.aichat.type="stdio"',
+        'mcp_servers.aichat.command="uv"',
+        f'mcp_servers.aichat.args=["run", "python3", "{mcp_script}"]',
+        f'mcp_servers.aichat.env.AICHAT_IPC_SOCKET="{ipc_socket}"',
+        f'mcp_servers.aichat.env.AICHAT_CHANNEL_ID="{channel_id}"',
     ]
-
-    codex_home = tempfile.mkdtemp(prefix="codex_home_")
-    config_path = os.path.join(codex_home, "config.toml")
-    with open(config_path, "w") as f:
-        f.write("\n".join(lines))
-
-    log.info("Wrote Codex config to %s", config_path)
-    return codex_home
 
 
 # ---------------------------------------------------------------------------
@@ -488,17 +475,15 @@ async def run_agent(
 
     next_prompt: str | None = initial_prompt
 
-    # Set up temporary CODEX_HOME with MCP server config
-    codex_home: str | None = None
-    codex_env: dict[str, str] = {}
+    # Build MCP config overrides for codex app-server
+    config_overrides: list[str] = []
     if channel_id:
-        codex_home = _setup_codex_home(ipc_socket or "", channel_id)
-        codex_env["CODEX_HOME"] = codex_home
+        config_overrides = _build_mcp_config_overrides(ipc_socket or "", channel_id)
 
     try:
         # Outer loop: each iteration is a fresh Codex thread
         while True:
-            codex = CodexAppServer(extra_env=codex_env)
+            codex = CodexAppServer(config_overrides=config_overrides)
 
             # Register notification handlers
             agent_text_buffer: list[str] = []
@@ -820,9 +805,6 @@ async def run_agent(
                 pass
         if ipc_socket and hasattr(api, "close"):
             await api.close()
-        if codex_home and os.path.exists(codex_home):
-            import shutil
-            shutil.rmtree(codex_home, ignore_errors=True)
 
 
 def main() -> None:
