@@ -880,6 +880,16 @@ class DeviceManager:
         )
         self._save_worker_pids()
 
+        # Persist agent_type to local DB (survives device.json overwrites)
+        try:
+            channel = await self.local_db.get_channel(channel_id)
+            if channel:
+                await self.local_db.save_channel(
+                    channel_id, channel["name"], agent_type=effective_agent_type,
+                )
+        except Exception as e:
+            log.warning("Failed to save agent_type to local DB: %s", e)
+
     async def stop_worker(self, channel_id: str) -> None:
         """Gracefully stop a worker."""
         worker = self.workers.pop(channel_id, None)
@@ -1097,6 +1107,12 @@ class DeviceManager:
 
         # Start workers for channels not yet running (adopt live PIDs from previous run)
         for channel_id in server_channel_ids - local_channel_ids:
+            # Resolve agent_type: local DB (authoritative) > device.json > default
+            local_channel = await self.local_db.get_channel(channel_id)
+            db_agent_type = (local_channel or {}).get("agent_type", "")
+            pid_agent_type = saved_pids.get(channel_id, {}).get("agent_type", "")
+            resolved_agent_type = db_agent_type or pid_agent_type or ""
+
             if channel_id in saved_pids:
                 pid = saved_pids[channel_id].get("pid")
                 if pid:
@@ -1104,7 +1120,7 @@ class DeviceManager:
                         os.kill(pid, 0)  # Check if alive
                         saved_wd = saved_pids[channel_id].get("working_directory", "")
                         saved_started = saved_pids[channel_id].get("started_at", 0.0)
-                        log.info("Adopting live worker for channel %s (pid=%s)", channel_id, pid)
+                        log.info("Adopting live worker for channel %s (pid=%s, agent=%s)", channel_id, pid, resolved_agent_type or self.default_agent_type)
                         self.workers[channel_id] = WorkerProcess(
                             proc=None,
                             channel_id=channel_id,
@@ -1113,16 +1129,15 @@ class DeviceManager:
                             working_directory=saved_wd,
                             adopted=True,
                             adopted_pid=pid,
-                            agent_type=saved_pids[channel_id].get("agent_type", "claude"),
+                            agent_type=resolved_agent_type or self.default_agent_type,
                         )
                         continue
                     except OSError:
                         pass  # Dead, start a new one
             ch_info = server_channels[channel_id]
             working_directory = ch_info.get("working_directory", "")
-            saved_agent_type = saved_pids.get(channel_id, {}).get("agent_type", "")
-            log.info("Channel %s assigned to device, starting worker (cwd=%s, agent=%s)", channel_id, working_directory or "<default>", saved_agent_type or self.default_agent_type)
-            await self.start_worker(channel_id, working_directory=working_directory, agent_type=saved_agent_type)
+            log.info("Channel %s assigned to device, starting worker (cwd=%s, agent=%s)", channel_id, working_directory or "<default>", resolved_agent_type or self.default_agent_type)
+            await self.start_worker(channel_id, working_directory=working_directory, agent_type=resolved_agent_type)
 
     async def report_status(self) -> None:
         """Report device status to the server via WebSocket."""

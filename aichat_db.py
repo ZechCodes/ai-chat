@@ -74,14 +74,16 @@ class LocalDB:
         await self._db.executescript(_SCHEMA)
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA foreign_keys=ON")
-        # Migration: drop channel_key_b64 column if it exists (SQLite 3.35+)
+        # Migrations
         try:
             cursor = await self._db.execute("PRAGMA table_info(channels)")
             cols = [row[1] for row in await cursor.fetchall()]
             if "channel_key_b64" in cols:
                 await self._db.execute("ALTER TABLE channels DROP COLUMN channel_key_b64")
+            if "agent_type" not in cols:
+                await self._db.execute("ALTER TABLE channels ADD COLUMN agent_type TEXT DEFAULT 'claude'")
         except Exception:
-            pass  # Old SQLite or column already gone
+            pass
         await self._db.commit()
 
     async def close(self) -> None:
@@ -211,18 +213,20 @@ class LocalDB:
         device_id: str | None = None,
         working_directory: str | None = None,
         additional_directories: list[str] | None = None,
+        agent_type: str | None = None,
     ) -> None:
         """Insert or update a channel."""
         now = _now()
         await self.db.execute(
             """INSERT INTO channels (id, name, device_id, working_directory,
-                   additional_directories, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
+                   additional_directories, agent_type, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(id) DO UPDATE SET
                    name = excluded.name,
                    device_id = excluded.device_id,
                    working_directory = COALESCE(excluded.working_directory, channels.working_directory),
                    additional_directories = COALESCE(excluded.additional_directories, channels.additional_directories),
+                   agent_type = COALESCE(excluded.agent_type, channels.agent_type),
                    updated_at = excluded.updated_at""",
             (
                 channel_id,
@@ -230,6 +234,7 @@ class LocalDB:
                 device_id,
                 working_directory,
                 json.dumps(additional_directories) if additional_directories else None,
+                agent_type,
                 now,
                 now,
             ),
