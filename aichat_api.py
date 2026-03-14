@@ -20,7 +20,6 @@ class AiChatAPI:
         channel_id: str | None = None,
     ):
         self.base_url = (base_url or os.environ.get("AICHAT_URL", "https://aichat.zech.sh")).rstrip("/")
-        self.device_id = device_id
 
         if device_key:
             # Device key auth: use device's key with channel_id
@@ -29,17 +28,27 @@ class AiChatAPI:
             key_bytes = _b64.b64decode(device_key)
             self._private_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
             self.channel_id = channel_id
-        else:
-            # Legacy: compound token or tokens.json
+            self.device_id = device_id or os.environ.get("AICHAT_DEVICE_ID")
+        elif token is not None:
+            # Explicit token mode: token is source of truth (ignore channel/device env fallbacks)
             self._private_key = get_private_key(token=token)
             self.channel_id = channel_id or get_channel_id(token=token)
+            self.device_id = device_id
+        else:
+            # Legacy: compound token or tokens.json
+            self._private_key = get_private_key()
+            self.channel_id = channel_id or get_channel_id()
+            self.device_id = device_id or os.environ.get("AICHAT_DEVICE_ID")
 
     def _sign_request(self, method: str, path: str) -> dict[str, str]:
         """Sign a request and return auth headers."""
-        headers = sign_request(method, path, private_key=self._private_key, channel_id=self.channel_id)
-        if self.device_id:
-            headers["X-Device-Id"] = self.device_id
-        return headers
+        return sign_request(
+            method,
+            path,
+            private_key=self._private_key,
+            channel_id=self.channel_id,
+            device_id=self.device_id,
+        )
 
     async def send_message(self, content: str) -> dict:
         """POST /api/messages"""
@@ -79,7 +88,7 @@ class AiChatAPI:
         if description:
             body["description"] = description
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(f"{self.base_url}{path}", json=body, headers=headers, timeout=5)
+            await client.post(f"{self.base_url}{path}", json=body, headers=headers, timeout=5)
 
     async def get_session(self) -> httpx.Cookies:
         """POST /api/session — exchange Ed25519 auth for a session cookie."""

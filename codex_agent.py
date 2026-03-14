@@ -287,7 +287,7 @@ def _parse_sse_event(line: str, channel_id: str | None) -> dict | None:
             "_event_type": "message",
             "message_id": event.get("message_id"),
             "content": event.get("content", ""),
-            "attachments": event.get("attachments", []),
+            "attachments": event.get("attachments") or [],
         }
 
     if (
@@ -359,7 +359,7 @@ async def listen_ipc(
             await message_queue.put({
                 "message_id": msg.get("message_id"),
                 "content": msg.get("content", ""),
-                "attachments": msg.get("attachments", []),
+                "attachments": msg.get("attachments") or [],
             })
         elif msg_type == MSG_EVENT_PLAN:
             await message_queue.put({"content": msg.get("content", "")})
@@ -639,7 +639,7 @@ async def run_agent(
 
                 # Send initial turn with instructions
                 initial_input = instructions if instructions.strip() else "Check in with Zech."
-                turn_result = await codex.send_request("turn/start", {
+                await codex.send_request("turn/start", {
                     "threadId": current_thread_id,
                     "input": [{"type": "text", "text": initial_input}],
                 })

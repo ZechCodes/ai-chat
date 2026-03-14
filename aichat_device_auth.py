@@ -16,8 +16,6 @@ from pathlib import Path
 import httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from aichat_crypto import generate_x25519_keypair
-
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "aichat" / "device.json"
 
 

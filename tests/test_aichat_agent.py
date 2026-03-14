@@ -1,8 +1,7 @@
 """Tests for the agent wrapper."""
 
-import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -23,24 +22,41 @@ def interactions():
     return InteractionManager()
 
 
+@pytest.fixture
+def build_inputs():
+    import asyncio
+
+    return {
+        "message_queue": asyncio.Queue(),
+        "skipped_messages": [],
+        "hook_state": {
+            "last_send_time": 0,
+            "last_unread_notify": 0,
+            "last_silence_remind": 0,
+            "last_silence_remind_bg": 0,
+            "working": False,
+        },
+    }
+
+
 class TestBuildAgentOptions:
-    def test_returns_options_with_hooks(self, api, interactions):
-        options = build_agent_options(api, interactions)
+    def test_returns_options_with_hooks(self, api, interactions, build_inputs):
+        options = build_agent_options(api, interactions, **build_inputs)
         assert options.hooks is not None
         assert "PreToolUse" in options.hooks
         assert "PostToolUse" in options.hooks
         assert "Stop" in options.hooks
 
-    def test_sets_permission_mode(self, api, interactions):
-        options = build_agent_options(api, interactions)
+    def test_sets_permission_mode(self, api, interactions, build_inputs):
+        options = build_agent_options(api, interactions, **build_inputs)
         assert options.permission_mode == "plan"
 
-    def test_sets_can_use_tool(self, api, interactions):
-        options = build_agent_options(api, interactions)
+    def test_sets_can_use_tool(self, api, interactions, build_inputs):
+        options = build_agent_options(api, interactions, **build_inputs)
         assert options.can_use_tool is not None
 
-    def test_loads_project_settings(self, api, interactions):
-        options = build_agent_options(api, interactions)
+    def test_loads_project_settings(self, api, interactions, build_inputs):
+        options = build_agent_options(api, interactions, **build_inputs)
         assert options.setting_sources is not None
         assert "project" in options.setting_sources
 

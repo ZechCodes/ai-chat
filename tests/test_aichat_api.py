@@ -25,6 +25,11 @@ class TestAiChatAPIInit:
     def test_has_private_key(self, api):
         assert api._private_key is not None
 
+    def test_explicit_token_ignores_channel_env(self, env_with_token, monkeypatch):
+        monkeypatch.setenv("AICHAT_CHANNEL_ID", "env-channel")
+        api = AiChatAPI(token=env_with_token)
+        assert api.channel_id == "test-channel-123"
+
     def test_raises_without_token(self, monkeypatch, tmp_path):
         monkeypatch.delenv("AICHAT_PRIVATE_KEY", raising=False)
         monkeypatch.delenv("AICHAT_DEVICE_KEY", raising=False)

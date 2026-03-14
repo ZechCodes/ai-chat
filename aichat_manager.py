@@ -284,12 +284,13 @@ class DeviceManager:
     async def _ws_fire_and_forget(self, msg: dict) -> None:
         """Send a message over WebSocket without awaiting a response."""
         if not self._ws:
-            return  # Silently drop if not connected (e.g. tool_status during reconnect)
+            log.debug("Dropping WS fire-and-forget message while disconnected: %s", msg.get("type"))
+            return
         try:
             async with self._ws_lock:
                 await self._ws.send(json.dumps(msg))
-        except Exception:
-            pass  # Best-effort for fire-and-forget
+        except Exception as e:
+            log.debug("WS fire-and-forget send failed for %s: %s", msg.get("type"), e)
 
     async def _handle_ws_event(self, event: dict) -> None:
         """Handle a notification event received over WebSocket."""
@@ -443,14 +444,14 @@ class DeviceManager:
             return
 
         content = ""
-        attachments = None
+        attachments: list = []
         if self.encryption_key_b64:
             try:
                 plain = crypto_decrypt(self.encryption_key_b64, encrypted_payload, nonce)
                 if plain:
                     payload = json.loads(plain)
                     content = payload.get("content", "")
-                    attachments = payload.get("attachments")
+                    attachments = payload.get("attachments") or []
             except Exception as e:
                 log.warning("Failed to decrypt user content relay: %s", e)
 
@@ -461,7 +462,7 @@ class DeviceManager:
                 sender="user",
                 content=content,
                 message_id=message_id,
-                attachments=json.dumps(attachments) if attachments else None,
+                attachments=attachments if attachments else None,
             )
         except Exception as e:
             log.warning("Failed to save user content to local DB: %s", e)
@@ -1028,14 +1029,15 @@ class DeviceManager:
         """Get current device status with worker health info."""
         workers = []
         for channel_id, worker in self.workers.items():
-            status = "running" if worker.proc.returncode is None else "crashed"
+            status = "running" if worker.is_alive() else "crashed"
+            pid = worker.pid
             info = {
                 "channel_id": channel_id,
                 "status": status,
                 "uptime": int(time.time() - worker.started_at),
             }
-            if status == "running" and worker.proc.pid:
-                mem = self._get_worker_memory_mb(worker.proc.pid)
+            if status == "running" and pid:
+                mem = self._get_worker_memory_mb(pid)
                 if mem is not None:
                     info["memory_mb"] = round(mem, 1)
             workers.append(info)

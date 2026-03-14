@@ -1,13 +1,9 @@
 """Tests for the device manager."""
 
-import asyncio
 import base64
-import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import pytest
-import respx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from aichat_manager import (
@@ -20,7 +16,7 @@ from aichat_manager import (
 class TestParseDeviceCommand:
     def test_parses_worker_start(self):
         event = {
-            "type": "aichat:device-command",
+            "event_type": "aichat:device-command",
             "command": "worker:start",
             "payload": {"channel_id": "ch-abc", "channel_token": "tok-123"},
         }
@@ -31,7 +27,7 @@ class TestParseDeviceCommand:
 
     def test_parses_worker_stop(self):
         event = {
-            "type": "aichat:device-command",
+            "event_type": "aichat:device-command",
             "command": "worker:stop",
             "payload": {"channel_id": "ch-abc"},
         }
@@ -40,7 +36,7 @@ class TestParseDeviceCommand:
         assert result["command"] == "worker:stop"
 
     def test_ignores_non_command_events(self):
-        event = {"type": "aichat:message", "content": "hello"}
+        event = {"event_type": "aichat:message", "content": "hello"}
         assert parse_device_command(event) is None
 
     def test_ignores_missing_type(self):
@@ -49,7 +45,7 @@ class TestParseDeviceCommand:
 
     def test_parses_device_ping(self):
         event = {
-            "type": "aichat:device-command",
+            "event_type": "aichat:device-command",
             "command": "device:ping",
             "payload": {},
         }
@@ -83,8 +79,9 @@ class TestDeviceManager:
 
     @pytest.mark.asyncio
     async def test_start_worker_launches_subprocess(self, manager):
-        mock_proc = AsyncMock()
+        mock_proc = MagicMock()
         mock_proc.returncode = None
+        mock_proc.wait = AsyncMock()
         with patch("aichat_manager.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
             await manager.start_worker("ch-abc", "tok-abc")
             assert "ch-abc" in manager.workers
@@ -94,13 +91,14 @@ class TestDeviceManager:
 
     @pytest.mark.asyncio
     async def test_start_worker_stops_existing_first(self, manager):
-        old_proc = AsyncMock()
+        old_proc = MagicMock()
         old_proc.returncode = None
         old_proc.wait = AsyncMock()
         manager.workers["ch-abc"] = WorkerProcess(proc=old_proc, channel_id="ch-abc", channel_token="old-tok")
 
-        new_proc = AsyncMock()
+        new_proc = MagicMock()
         new_proc.returncode = None
+        new_proc.wait = AsyncMock()
         with patch("aichat_manager.asyncio.create_subprocess_exec", return_value=new_proc):
             await manager.start_worker("ch-abc", "new-tok")
             old_proc.terminate.assert_called_once()
@@ -108,7 +106,8 @@ class TestDeviceManager:
 
     @pytest.mark.asyncio
     async def test_stop_worker(self, manager):
-        proc = AsyncMock()
+        proc = MagicMock()
+        proc.returncode = None
         proc.wait = AsyncMock()
         manager.workers["ch-abc"] = WorkerProcess(proc=proc, channel_id="ch-abc", channel_token="tok")
 
@@ -123,8 +122,9 @@ class TestDeviceManager:
 
     @pytest.mark.asyncio
     async def test_handle_command_worker_start(self, manager):
-        mock_proc = AsyncMock()
+        mock_proc = MagicMock()
         mock_proc.returncode = None
+        mock_proc.wait = AsyncMock()
         with patch("aichat_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
             await manager.handle_command({
                 "command": "worker:start",
@@ -134,7 +134,8 @@ class TestDeviceManager:
 
     @pytest.mark.asyncio
     async def test_handle_command_worker_stop(self, manager):
-        proc = AsyncMock()
+        proc = MagicMock()
+        proc.returncode = None
         proc.wait = AsyncMock()
         manager.workers["ch-1"] = WorkerProcess(proc=proc, channel_id="ch-1", channel_token="tok-1")
 
@@ -146,13 +147,14 @@ class TestDeviceManager:
 
     @pytest.mark.asyncio
     async def test_handle_command_worker_restart(self, manager):
-        old_proc = AsyncMock()
+        old_proc = MagicMock()
         old_proc.returncode = None
         old_proc.wait = AsyncMock()
         manager.workers["ch-1"] = WorkerProcess(proc=old_proc, channel_id="ch-1", channel_token="tok-1")
 
-        new_proc = AsyncMock()
+        new_proc = MagicMock()
         new_proc.returncode = None
+        new_proc.wait = AsyncMock()
         with patch("aichat_manager.asyncio.create_subprocess_exec", return_value=new_proc):
             await manager.handle_command({
                 "command": "worker:restart",
@@ -195,52 +197,65 @@ class TestDeviceManager:
         assert status["workers"][0]["status"] == "crashed"
         assert "memory_mb" not in status["workers"][0]
 
-    @respx.mock
+    def test_get_status_adopted_worker(self, manager):
+        manager.workers["ch-1"] = WorkerProcess(
+            proc=None,
+            channel_id="ch-1",
+            channel_token="",
+            adopted=True,
+            adopted_pid=43210,
+        )
+        with patch("aichat_manager.os.kill") as mock_kill:
+            mock_kill.return_value = None
+            with patch.object(manager, "_get_worker_memory_mb", return_value=12.3):
+                status = manager.get_status()
+        assert status["workers"][0]["status"] == "running"
+        assert status["workers"][0]["memory_mb"] == 12.3
+
     @pytest.mark.asyncio
     async def test_report_status(self, manager):
-        route = respx.post("https://aichat.zech.sh/api/device/status").mock(
-            return_value=httpx.Response(200, json={"ok": True})
-        )
-        await manager.report_status()
-        assert route.called
+        with patch.object(manager, "_ws_request", AsyncMock(return_value={"ok": True})) as mock_ws:
+            await manager.report_status()
+        mock_ws.assert_awaited_once()
+        payload = mock_ws.await_args.args[0]
+        assert payload["type"] == "report_status"
+        assert payload["device_id"] == "dev-123"
 
-    @respx.mock
     @pytest.mark.asyncio
     async def test_sync_channels_starts_missing(self, manager):
-        respx.get("https://aichat.zech.sh/api/device/channels").mock(
-            return_value=httpx.Response(200, json={"channels": [
+        with patch.object(manager, "_ws_request", AsyncMock(return_value={"channels": [
                 {"id": "ch-1", "name": "Task 1"},
                 {"id": "ch-2", "name": "Task 2"},
-            ]})
-        )
-        new_proc = AsyncMock()
-        new_proc.returncode = None
-        with patch("aichat_manager.asyncio.create_subprocess_exec", return_value=new_proc):
-            await manager.sync_channels()
+            ]})):
+            new_proc = MagicMock()
+            new_proc.returncode = None
+            new_proc.wait = AsyncMock()
+            with patch("aichat_manager.asyncio.create_subprocess_exec", return_value=new_proc):
+                await manager.sync_channels()
         assert "ch-1" in manager.workers
         assert "ch-2" in manager.workers
 
-    @respx.mock
     @pytest.mark.asyncio
     async def test_sync_channels_stops_removed(self, manager):
-        proc = AsyncMock()
+        proc = MagicMock()
+        proc.returncode = None
         proc.wait = AsyncMock()
         manager.workers["ch-old"] = WorkerProcess(proc=proc, channel_id="ch-old", channel_token="")
 
-        respx.get("https://aichat.zech.sh/api/device/channels").mock(
-            return_value=httpx.Response(200, json={"channels": []})
-        )
-        await manager.sync_channels()
+        with patch.object(manager, "_ws_request", AsyncMock(return_value={"channels": []})):
+            await manager.sync_channels()
         assert "ch-old" not in manager.workers
         proc.terminate.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_monitor_detects_crashed_worker(self, manager):
-        crashed_proc = AsyncMock()
+        crashed_proc = MagicMock()
         crashed_proc.returncode = 1  # crashed
+        crashed_proc.wait = AsyncMock()
 
-        new_proc = AsyncMock()
+        new_proc = MagicMock()
         new_proc.returncode = None
+        new_proc.wait = AsyncMock()
 
         manager.workers["ch-1"] = WorkerProcess(
             proc=crashed_proc, channel_id="ch-1", channel_token="tok-1"

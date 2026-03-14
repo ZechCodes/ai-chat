@@ -60,17 +60,25 @@ def _get_token() -> str | None:
 
 def get_private_key(token: str | None = None) -> Ed25519PrivateKey:
     """Load the Ed25519 private key from token or device env vars."""
-    # Device auth env vars take priority
+    if token is not None:
+        parsed = _parse_compound_token(token)
+        if not parsed:
+            raise SystemExit("Error: Invalid token format (expected compound token)")
+        key_b64, _ = parsed
+        key_bytes = base64.b64decode(key_b64)
+        return Ed25519PrivateKey.from_private_bytes(key_bytes)
+
+    # Device auth env vars take priority when token is not explicitly provided
     device_key = os.environ.get("AICHAT_DEVICE_KEY")
     if device_key:
         key_bytes = base64.b64decode(device_key)
         return Ed25519PrivateKey.from_private_bytes(key_bytes)
 
-    token = token or _get_token()
-    if not token:
+    resolved_token = _get_token()
+    if not resolved_token:
         raise SystemExit("Error: No aichat token found (set AICHAT_DEVICE_KEY or register with aichat-register)")
 
-    parsed = _parse_compound_token(token)
+    parsed = _parse_compound_token(resolved_token)
     if not parsed:
         raise SystemExit("Error: Invalid token format (expected compound token)")
 
@@ -81,15 +89,21 @@ def get_private_key(token: str | None = None) -> Ed25519PrivateKey:
 
 def get_channel_id(token: str | None = None) -> str | None:
     """Extract channel_id from the compound token or device env vars."""
-    # Device auth env vars take priority
+    if token is not None:
+        parsed = _parse_compound_token(token)
+        if not parsed:
+            return None
+        return parsed[1]
+
+    # Device auth env vars take priority when token is not explicitly provided
     channel_id = os.environ.get("AICHAT_CHANNEL_ID")
     if channel_id:
         return channel_id
 
-    token = token or _get_token()
-    if not token:
+    resolved_token = _get_token()
+    if not resolved_token:
         return None
-    parsed = _parse_compound_token(token)
+    parsed = _parse_compound_token(resolved_token)
     if parsed:
         return parsed[1]
     return None
@@ -106,7 +120,12 @@ def has_token() -> bool:
 
 
 def sign_request(
-    method: str, path: str, *, private_key: Ed25519PrivateKey, channel_id: str | None = None
+    method: str,
+    path: str,
+    *,
+    private_key: Ed25519PrivateKey,
+    channel_id: str | None = None,
+    device_id: str | None = None,
 ) -> dict[str, str]:
     """Sign a request and return headers to include.
 
@@ -124,7 +143,8 @@ def sign_request(
         channel_id = get_channel_id()
     if channel_id:
         headers["X-Channel"] = channel_id
-    device_id = get_device_id()
+    if device_id is None:
+        device_id = get_device_id()
     if device_id:
         headers["X-Device-Id"] = device_id
     return headers

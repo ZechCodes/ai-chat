@@ -2,8 +2,6 @@
 
 import base64
 import json
-from pathlib import Path
-from unittest.mock import patch
 
 import httpx
 import pytest
