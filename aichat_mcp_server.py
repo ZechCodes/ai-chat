@@ -101,7 +101,7 @@ def create_server() -> Server:
                 name="set_directories",
                 description=(
                     "Report your working directory and any additional project directories you are accessing. "
-                    "Call this when you start working in a new directory."
+                    "Call this when you start working in a new directory or need access to additional project roots."
                 ),
                 inputSchema={
                     "type": "object",
@@ -147,19 +147,23 @@ def create_server() -> Server:
             if not messages:
                 return [TextContent(type="text", text="No unread messages.")]
 
-            lines = []
-            for msg in messages[:20]:
-                sender = msg.get("sender", "user")
-                msg_id = msg.get("id") or msg.get("message_id") or "?"
-                content = (msg.get("content") or "").strip()
-                if not content:
-                    content = "[no plaintext content]"
-                if len(content) > 300:
-                    content = content[:300] + "..."
-                lines.append(f"{msg_id} [{sender}]: {content}")
+            ids_to_mark = [
+                m.get("id") or m.get("message_id")
+                for m in messages
+                if m.get("id") or m.get("message_id")
+            ]
+            if ids_to_mark:
+                try:
+                    await api.mark_read(ids_to_mark)
+                except Exception as e:
+                    log.warning("Failed to mark messages read: %s", e)
 
-            if len(messages) > 20:
-                lines.append(f"...and {len(messages) - 20} more.")
+            lines = []
+            for msg in messages:
+                content = msg.get("content", "")
+                attachments = msg.get("attachments", [])
+                att_note = f" [{len(attachments)} attachment(s)]" if attachments else ""
+                lines.append(f"Zech: {content}{att_note}")
 
             return [TextContent(type="text", text="\n".join(lines))]
 

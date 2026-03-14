@@ -1,6 +1,16 @@
 """Tests for codex_agent helper behavior."""
 
-from codex_agent import _build_mcp_config_overrides
+import asyncio
+
+import pytest
+
+from codex_agent import (
+    SSE_CONTEXT,
+    _await_next_message_or_listener_failure,
+    _build_mcp_config_overrides,
+    _format_mcp_tool_name,
+    run_agent,
+)
 
 
 def test_build_mcp_config_overrides_with_ipc_and_auth():
@@ -33,3 +43,29 @@ def test_build_mcp_config_overrides_direct_mode_omits_ipc():
     assert 'mcp_servers.aichat.env.AICHAT_CHANNEL_ID="ch-xyz"' in overrides
     assert 'mcp_servers.aichat.env.AICHAT_TOKEN="tok-direct"' in overrides
     assert all("AICHAT_IPC_SOCKET" not in item for item in overrides)
+
+
+def test_sse_context_includes_planning_guidance():
+    assert "For complex tasks, use planning mode" in SSE_CONTEXT
+    assert "AskUserQuestion tool" in SSE_CONTEXT
+
+
+def test_format_mcp_tool_name_uses_double_underscore_form():
+    assert _format_mcp_tool_name("aichat", "send") == "mcp__aichat__send"
+    assert _format_mcp_tool_name("", "send") == "mcp__send"
+    assert _format_mcp_tool_name("aichat", "") == "mcp__aichat"
+
+
+@pytest.mark.asyncio
+async def test_queue_wait_raises_if_event_listener_exits():
+    queue: asyncio.Queue[dict] = asyncio.Queue()
+    event_task = asyncio.create_task(asyncio.sleep(0))
+    await event_task
+    with pytest.raises(RuntimeError, match="Event listener task exited unexpectedly"):
+        await _await_next_message_or_listener_failure(queue, event_task)
+
+
+@pytest.mark.asyncio
+async def test_requires_channel_id_when_ipc_socket_provided():
+    with pytest.raises(ValueError, match="--channel-id is required"):
+        await run_agent(ipc_socket="/tmp/aichat-test.sock")

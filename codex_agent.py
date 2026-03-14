@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import json
 import logging
 import os
@@ -220,6 +221,11 @@ SSE_CONTEXT = (
     "- This is a casual chat. Be concise and human. Don't narrate your "
     "thought process or explain what you're about to do — just do it. "
     "Keep messages short and natural.\n"
+    "- For complex tasks, use planning mode instead of detailing plans "
+    "in chat messages.\n"
+    "- When you have a yes/no question or a question with 2-3 clear options, "
+    "use the AskUserQuestion tool to present choices instead of asking "
+    "in a chat message.\n\n"
 )
 
 COMPACT_PROMPT = (
@@ -343,6 +349,7 @@ async def listen_sse(
             log.info("SSE session acquired, connecting to notification stream")
             async with httpx.AsyncClient(cookies=cookies, timeout=httpx.Timeout(None, connect=10)) as http:
                 async with http.stream("GET", f"{api.base_url}/notifications/stream") as response:
+                    response.raise_for_status()
                     async for line in response.aiter_lines():
                         event_data = _parse_sse_event(line, api.channel_id)
                         if event_data is None:
@@ -358,9 +365,12 @@ async def listen_sse(
                             iid = event_data.get("interaction_id")
                             if iid:
                                 interactions.deliver_response(iid, event_data)
-        except Exception as e:
-            log.warning("SSE error: %s, reconnecting in 5s", e)
+        except httpx.HTTPError as e:
+            log.warning("SSE connection error: %s, reconnecting in 5s", e)
             await asyncio.sleep(5)
+        except Exception as e:
+            log.error("SSE unexpected error: %s, reconnecting in 10s", e)
+            await asyncio.sleep(10)
 
 
 async def listen_ipc(
@@ -394,11 +404,14 @@ async def listen_ipc(
                 })
 
     ipc_client.on_event(handle_event)
+    listen_task = getattr(ipc_client, "_listen_task", None)
+    if not listen_task:
+        raise RuntimeError("IPC listener task not started")
     try:
-        while True:
-            await asyncio.sleep(3600)
+        await listen_task
     except asyncio.CancelledError:
-        pass
+        raise
+    raise ConnectionError("IPC listener stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +452,47 @@ def _drain_queue(message_queue: asyncio.Queue) -> list[dict]:
     return items
 
 
+async def _await_next_message_or_listener_failure(
+    message_queue: asyncio.Queue,
+    event_task: asyncio.Task,
+) -> dict:
+    """Wait for either a new message or listener failure."""
+    queue_task = asyncio.create_task(message_queue.get())
+    done, _ = await asyncio.wait({queue_task, event_task}, return_when=asyncio.FIRST_COMPLETED)
+
+    if event_task in done:
+        queue_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await queue_task
+        if event_task.cancelled():
+            raise RuntimeError("Event listener task was cancelled unexpectedly")
+        exc = event_task.exception()
+        if exc:
+            raise RuntimeError("Event listener task failed") from exc
+        raise RuntimeError("Event listener task exited unexpectedly")
+
+    return queue_task.result()
+
+
+async def _send_startup_status(api, hook_state: dict) -> None:
+    """Send startup status without failing agent startup on transient errors."""
+    try:
+        await api.send_tool_status("active", tool="startup", description="Agent online.")
+        hook_state["last_send_time"] = time.time()
+    except Exception as e:
+        log.warning("Failed to send startup tool status: %s", e)
+
+
+def _format_mcp_tool_name(server: str, tool_name: str) -> str:
+    if server and tool_name:
+        return f"mcp__{server}__{tool_name}"
+    if tool_name:
+        return f"mcp__{tool_name}"
+    if server:
+        return f"mcp__{server}"
+    return "mcp"
+
+
 # ---------------------------------------------------------------------------
 # Main agent loop
 # ---------------------------------------------------------------------------
@@ -456,6 +510,8 @@ async def run_agent(
 
     # Choose API backend
     if ipc_socket:
+        if not channel_id:
+            raise ValueError("--channel-id is required when --ipc-socket is provided")
         from aichat_ipc import IPCClient
         api = IPCClient(ipc_socket, channel_id)
         await api.connect()
@@ -472,6 +528,7 @@ async def run_agent(
 
     interactions = InteractionManager()
     message_queue: asyncio.Queue[dict] = asyncio.Queue()
+    skipped_messages: list[dict] = []  # Older messages deferred by latest-first logic
     hook_state: dict = {
         "last_send_time": time.time(),
         "last_silence_remind_bg": 0,
@@ -483,8 +540,7 @@ async def run_agent(
     except Exception as e:
         log.warning("Failed to report working directory: %s", e)
 
-    await api.send_tool_status("active", tool="startup", description="Agent online. (Codex)")
-    hook_state["last_send_time"] = time.time()
+    await _send_startup_status(api, hook_state)
     log.info("Codex agent started, channel=%s, cwd=%s", channel_id or "?", cwd)
 
     # Start event listener
@@ -569,7 +625,8 @@ async def run_agent(
                 elif item_type == "mcpToolCall":
                     tool_name = item.get("tool", "")
                     server = item.get("server", "")
-                    await api.send_tool_status("active", tool=f"mcp:{server}:{tool_name}", description=f"Calling {tool_name}")
+                    mcp_tool = _format_mcp_tool_name(server, tool_name)
+                    await api.send_tool_status("active", tool=mcp_tool, description=f"Calling {tool_name}")
                 elif item_type == "agentMessage":
                     agent_text_buffer.clear()
                     await api.send_tool_status("active", tool="reasoning", description="Thinking...")
@@ -593,7 +650,7 @@ async def run_agent(
                     # Check if this was an aichat send call — update send time
                     if server == "aichat" and tool_name == "send":
                         hook_state["last_send_time"] = time.time()
-                    await api.send_tool_status("done", tool=f"mcp:{server}:{tool_name}")
+                    await api.send_tool_status("done", tool=_format_mcp_tool_name(server, tool_name))
                 elif item_type == "agentMessage":
                     text = item.get("text", "")
                     if text:
@@ -683,19 +740,28 @@ async def run_agent(
 
                 # Wait for turn to complete (notifications handle the rest)
                 # Then enter message loop
-                deferred_messages: list[dict] = []
+                pending_plan_event = None
                 while True:
-                    if deferred_messages:
-                        msg_data = deferred_messages.pop(0)
+                    # Drain queue: latest-first when multiple messages pending
+                    pending = _drain_queue(message_queue)
+                    if not pending:
+                        # Nothing available — block for the next message
+                        msg_data = await _await_next_message_or_listener_failure(message_queue, event_task)
+                    elif len(pending) == 1:
+                        msg_data = pending[0]
                     else:
-                        pending = _drain_queue(message_queue)
-                        if not pending:
-                            msg_data = await message_queue.get()
-                        elif len(pending) == 1:
-                            msg_data = pending[0]
+                        # Multiple pending: take the latest, store older in skipped_messages
+                        # Separate system messages and real messages
+                        real_msgs = [m for m in pending if not m.get("_system")]
+                        system_msgs = [m for m in pending if m.get("_system")]
+                        if real_msgs:
+                            msg_data = real_msgs[-1]  # latest real message
+                            skipped_messages.extend(real_msgs[:-1])  # older real messages
+                            # System messages queued up alongside real messages can be dropped
+                        elif system_msgs:
+                            msg_data = system_msgs[-1]  # latest system message
                         else:
-                            msg_data = pending[0]
-                            deferred_messages.extend(pending[1:])
+                            continue  # shouldn't happen, but be safe
 
                     # System messages
                     if msg_data.get("_system"):
@@ -722,8 +788,10 @@ async def run_agent(
                                 })
                         continue
 
-                    # Plan events: buffer
+                    # Plan events: buffer and wait for the next user message
                     if msg_data.get("content", "").startswith("plan:"):
+                        pending_plan_event = msg_data.get("content")
+                        log.info("Buffered plan event: %s", pending_plan_event)
                         continue
 
                     content = msg_data.get("content", "")
@@ -806,6 +874,22 @@ async def run_agent(
                     prompt = f"New message from Zech:\n{content}"
                     if attachment_notes:
                         prompt += "\n\n" + "\n".join(attachment_notes)
+
+                    # Note about skipped older messages
+                    if skipped_messages:
+                        n = len(skipped_messages)
+                        prompt += (
+                            f"\n\n[System: There are {n} older message(s). "
+                            f"Use the mcp__aichat__read_unread tool to read them.]"
+                        )
+
+                    # Inject plan mode instruction if a plan event was buffered
+                    if pending_plan_event:
+                        if pending_plan_event == "plan:enter":
+                            prompt += "\n\n[System: The user has activated planning mode. Use /plan to enter plan mode before responding.]"
+                        elif pending_plan_event == "plan:exit":
+                            prompt += "\n\n[System: The user has deactivated planning mode.]"
+                        pending_plan_event = None
 
                     if current_thread_id:
                         # If turn is active, interrupt then start new turn
