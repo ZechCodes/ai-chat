@@ -461,7 +461,7 @@ async def run_agent(
     except Exception as e:
         log.warning("Failed to report working directory: %s", e)
 
-    await api.send_message("Agent online. (Codex)")
+    await api.send_tool_status("active", tool="startup", description="Agent online. (Codex)")
     hook_state["last_send_time"] = time.time()
     log.info("Codex agent started, channel=%s, cwd=%s", channel_id or "?", cwd)
 
