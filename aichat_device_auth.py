@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import stat
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -17,6 +19,7 @@ import httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "aichat" / "device.json"
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -54,7 +57,22 @@ def generate_device_keypair() -> dict:
 def save_device_config(config: DeviceConfig, path: Path = DEFAULT_CONFIG_PATH) -> None:
     """Save device config to disk with restricted permissions."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(config), indent=2))
+    content = json.dumps(asdict(config), indent=2)
+    # Write to a temp file created with owner-only perms, then atomically replace.
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=".device.",
+        suffix=".tmp",
+        delete=False,
+    ) as tmp:
+        tmp.write(content)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_path = Path(tmp.name)
+    os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
+    os.replace(tmp_path, path)
     os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
 
 
@@ -73,6 +91,7 @@ def load_device_config(path: Path = DEFAULT_CONFIG_PATH) -> DeviceConfig | None:
         data.setdefault("encryption_key_b64", "")
         return DeviceConfig(**data)
     except Exception:
+        log.warning("Failed to load device config from %s", path, exc_info=True)
         return None
 
 

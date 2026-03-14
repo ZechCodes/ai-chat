@@ -10,6 +10,7 @@ import base64
 import json
 import os
 import time
+import binascii
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -20,12 +21,26 @@ TOKENS_PATH = Path.home() / ".config" / "aichat" / "tokens.json"
 def _parse_compound_token(token: str) -> tuple[str, str] | None:
     """Try to parse a compound token. Returns (private_key_b64, channel_id) or None."""
     try:
-        padding = 4 - len(token) % 4
-        if padding != 4:
-            token += "=" * padding
-        payload = json.loads(base64.urlsafe_b64decode(token))
-        if "k" in payload and "c" in payload and "s" in payload:
-            return payload["k"], payload["c"]
+        pad_len = (-len(token)) % 4
+        padded = token + ("=" * pad_len)
+        raw = base64.b64decode(padded.encode(), altchars=b"-_", validate=True)
+        payload = json.loads(raw.decode())
+        if not isinstance(payload, dict):
+            return None
+        key_b64 = payload.get("k")
+        channel_id = payload.get("c")
+        signature = payload.get("s")
+        if (
+            isinstance(key_b64, str)
+            and isinstance(channel_id, str)
+            and isinstance(signature, str)
+            and key_b64
+            and channel_id
+            and signature
+        ):
+            return key_b64, channel_id
+    except (binascii.Error, ValueError, TypeError, json.JSONDecodeError):
+        pass
     except Exception:
         pass
     return None
@@ -38,11 +53,14 @@ def _lookup_token_for_cwd() -> str | None:
     try:
         tokens = json.loads(TOKENS_PATH.read_text())
         cwd = os.getcwd()
-        # Try exact match first, then walk up parent dirs
-        while cwd != "/":
+        # Try exact match first, then walk up parent dirs including root.
+        while True:
             if cwd in tokens:
                 return tokens[cwd]
-            cwd = os.path.dirname(cwd)
+            parent = os.path.dirname(cwd)
+            if parent == cwd:
+                break
+            cwd = parent
         return None
     except Exception:
         return None
