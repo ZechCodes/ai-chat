@@ -1149,7 +1149,7 @@ class DeviceManager:
                     log.warning("Adopted worker %s (pid=%s) died, restarting", channel_id, worker.adopted_pid)
                 else:
                     log.warning("Worker %s crashed (rc=%s), restarting", channel_id, worker.proc.returncode)
-                await self.start_worker(channel_id, worker.channel_token, worker.working_directory)
+                await self.start_worker(channel_id, worker.channel_token, worker.working_directory, agent_type=worker.agent_type)
 
     async def monitor_workers(self) -> None:
         """Continuously monitor workers for crashes."""
