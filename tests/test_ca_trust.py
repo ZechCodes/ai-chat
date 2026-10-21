@@ -7,6 +7,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CaTrustTests(unittest.TestCase):
+    def test_local_installer_enforces_remediated_trust(self):
+        self.assertIn('required-version = ">=0.13.4"', (ROOT / "pyproject.toml").read_text())
+
     def test_locked_certifi_excludes_distrusted_roots(self):
         lock = (ROOT / "uv.lock").read_text()
         package = re.search(r'(?m)^name = "certifi"\nversion = "([^"\n]+)"', lock)

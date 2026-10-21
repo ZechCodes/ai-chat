@@ -17,3 +17,6 @@ test = [
     "pytest-asyncio>=0.24",
     "respx>=0.22",
 ]
+
+[tool.uv]
+required-version = ">=0.13.4"
